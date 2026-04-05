@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  claudeapi:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    ports:
+      - "${PORT:-3456}:3456"
+    volumes:
+      - claudeapi-data:/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3456
+      - DATA_DIR=/data
+      - CLUSTER_ENABLED=true
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-8}
+      - MAX_CONCURRENT_PER_USER=${MAX_CONCURRENT_PER_USER:-3}
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-50}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-sonnet}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3456/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  claudeapi-data:

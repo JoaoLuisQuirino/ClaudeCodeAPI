@@ -1,0 +1,51 @@
+# ── Single node ────────────────────────────────────────────────────
+# Usage: caddy run --config Caddyfile
+#
+# Replace claudeapi.example.com with your domain, or use :443 for IP-only.
+# Caddy handles TLS (Let's Encrypt) automatically.
+
+claudeapi.example.com {
+    # Reverse proxy to ClaudeAPI
+    reverse_proxy localhost:3456 {
+        # Health-check: mark backend down if /health/ready fails
+        health_uri    /health/ready
+        health_interval 10s
+        health_timeout  3s
+
+        # Stream-friendly: disable buffering
+        flush_interval -1
+    }
+
+    # Compress non-streaming responses
+    encode gzip
+
+    # Security headers
+    header {
+        X-Content-Type-Options    nosniff
+        X-Frame-Options           DENY
+        Referrer-Policy           no-referrer
+        -Server
+    }
+
+    # Rate limit (optional, requires caddy-ratelimit plugin)
+    # rate_limit {remote.ip} 100r/m
+}
+
+# ── Multi-node (horizontal scaling) ───────────────────────────────
+# Uncomment and adapt when scaling to multiple VPS.
+#
+# claudeapi.example.com {
+#     reverse_proxy {
+#         to node1.internal:3456
+#         to node2.internal:3456
+#         to node3.internal:3456
+#
+#         lb_policy       round_robin
+#         health_uri      /health/ready
+#         health_interval 10s
+#         health_timeout  3s
+#         flush_interval  -1
+#     }
+#
+#     encode gzip
+# }
