@@ -81,7 +81,18 @@ export async function agentHandler(req: IncomingMessage, res: ServerResponse): P
     allowNetwork: body.allow_network,
   });
 
-  res.on('close', () => cleanup());
+  let processFinished = false;
+  proc.on('close', () => { processFinished = true; });
+
+  res.on('close', () => {
+    if (processFinished) {
+      cleanup();
+      return;
+    }
+    log('info', 'Client disconnected — process continues in background', { userHash, sessionId });
+    const safetyTimer = setTimeout(() => cleanup(), 10 * 60 * 1000);
+    safetyTimer.unref();
+  });
 
   if (!proc.stdout) {
     cleanup();

@@ -86,9 +86,23 @@ export async function chatHandler(req: IncomingMessage, res: ServerResponse): Pr
   });
 
   const requestStartTime = Date.now();
+  let processFinished = false;
+  proc.on('close', () => { processFinished = true; });
+
   res.on('close', () => {
-    log('warn', 'Client connection closed', { userHash, sessionId: claudeSessionId || clientSessionId, durationMs: Date.now() - requestStartTime, pid: proc.pid });
-    cleanup();
+    if (processFinished) {
+      // Process already done — clean up immediately
+      cleanup();
+      return;
+    }
+    log('info', 'Client disconnected — process continues in background', {
+      userHash, sessionId: claudeSessionId || clientSessionId,
+      durationMs: Date.now() - requestStartTime, pid: proc.pid,
+    });
+    // Let the process finish so the session saves.
+    // Safety timeout kills orphaned processes after 10 min.
+    const safetyTimer = setTimeout(() => cleanup(), 10 * 60 * 1000);
+    safetyTimer.unref(); // don't block process exit
   });
 
   if (!proc.stdout) {
