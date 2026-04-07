@@ -21,7 +21,7 @@ import { uploadHandler } from './routes/upload.js';
 import { listFilesHandler, deleteFileHandler, downloadFileHandler } from './routes/files.js';
 import { chatCompletionsHandler } from './routes/chat-completions.js';
 import { usageHandler } from './routes/usage.js';
-import { authSetupHandler, authLoginHandler, authStatusHandler } from './routes/auth.js';
+import { authSetupHandler, authLoginHandler, authCallbackHandler, authStatusHandler } from './routes/auth.js';
 
 export interface AppServer {
   router: Router;
@@ -80,6 +80,7 @@ export function createApp(): AppServer {
   router.get('/usage', usageHandler);
   router.post('/auth/setup', authSetupHandler);
   router.post('/auth/login', authLoginHandler);
+  router.post('/auth/callback', authCallbackHandler);
   router.get('/auth/status/:login_id', authStatusHandler);
 
   // ── HTTP server ──
