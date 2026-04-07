@@ -1,4 +1,4 @@
-# ClaudeAPI
+# ClaudeCodeAPI
 
 Dois produtos em um: **Provider** (LLM endpoint) e **Agent** (agent completo com tools). HTTP API sobre o binario oficial do Claude Code. Cada user traz a propria subscription.
 
@@ -20,7 +20,7 @@ Client (browser, SDK, SmoothAgent, qualquer app)
     POST /chat { message, session_id, model, mcp_config }
     |
     v
-ClaudeAPI Server (Node.js, VPS)
+ClaudeCodeAPI Server (Node.js, VPS)
     |
     spawna: claude -p "message" \
               --output-format stream-json \
@@ -48,7 +48,7 @@ Varios users precisam usar ao mesmo tempo, cada um com SUA subscription:
 
 Estrategia de isolamento:
 ```
-/home/claudeapi/
+/home/claudecodeapi/
 ├── users/
 │   ├── user_abc/
 │   │   ├── .claude/          ← credentials desse user
@@ -60,7 +60,7 @@ Estrategia de isolamento:
 │   │   └── files/
 ```
 
-Cada `claude -p` roda com `HOME=/home/claudeapi/users/{userId}` para isolar credentials.
+Cada `claude -p` roda com `HOME=/home/claudecodeapi/users/{userId}` para isolar credentials.
 
 ### 2. Analise de arquivos nativo
 
@@ -115,14 +115,14 @@ Requests seguintes: ~0.1s (session reutilizada)
 
 Drop-in replacement pra `api.anthropic.com`. O app manda mensagens, recebe respostas. Funciona com qualquer SDK que suporte endpoint customizado (Vercel AI SDK, LangChain, OpenAI-compatible, etc).
 
-O user passa a chave OAuth dele (`sk-ant-oat01-...`) como API key. ClaudeAPI autentica o processo claude com as credentials do user automaticamente.
+O user passa a chave OAuth dele (`sk-ant-oat01-...`) como API key. ClaudeCodeAPI autentica o processo claude com as credentials do user automaticamente.
 
 ```
 // Qualquer app que use Anthropic SDK ou compativel:
 {
   "llmProvider": "anthropic",
   "llmApiKey": "sk-ant-oat01-...",        // chave subscription do user
-  "llmBaseUrl": "https://claudeapi.example.com"  // nosso endpoint
+  "llmBaseUrl": "https://claudecodeapi.example.com"  // nosso endpoint
 }
 
 // O app nem sabe que por tras é o binario claude
@@ -154,7 +154,7 @@ O user passa a key da subscription dele no header Authorization:
 Authorization: Bearer sk-ant-oat01-xxxxx
 ```
 
-ClaudeAPI:
+ClaudeCodeAPI:
 1. Extrai o token OAuth do header
 2. Escreve em /users/{hash}/. claude/.credentials.json
 3. Spawna `claude -p` com `HOME=/users/{hash}`
@@ -267,8 +267,8 @@ data: {"type":"result","usage":{"input_tokens":1500,"output_tokens":800},"cost_u
 ## Consumers
 
 ### Provider mode
-- **SmoothAgent**: `llmBaseUrl: "https://claudeapi.example.com"` — drop-in
-- **Vercel AI SDK**: `createAnthropic({ baseURL: "https://claudeapi.example.com" })`
+- **SmoothAgent**: `llmBaseUrl: "https://claudecodeapi.example.com"` — drop-in
+- **Vercel AI SDK**: `createAnthropic({ baseURL: "https://claudecodeapi.example.com" })`
 - **LangChain**: trocar endpoint, funciona
 - **Qualquer app**: compativel com Anthropic API ou OpenAI API
 - **Cursor/Continue/etc**: apontar pra nosso endpoint
@@ -281,7 +281,7 @@ data: {"type":"result","usage":{"input_tokens":1500,"output_tokens":800},"cost_u
 
 ## Diferencial vs alternativas
 
-| | API Anthropic | OpenClaw | ClaudeAPI Provider | ClaudeAPI Agent |
+| | API Anthropic | OpenClaw | ClaudeCodeAPI Provider | ClaudeCodeAPI Agent |
 |--|---|---|---|---|
 | Opus via subscription | Nao (per-token) | Bloqueado | **Sim** | **Sim** |
 | Drop-in replacement | N/A | Nao | **Sim** | N/A |
@@ -356,7 +356,7 @@ Cleanup: containers orfaos limpos a cada 5min
 
 ## Modelo de negocio
 
-ClaudeAPI pode ser:
+ClaudeCodeAPI pode ser:
 - **Self-hosted** (user roda no VPS dele, open source, $0)
 - **Hosted por nos** (a gente roda, user so passa a key, cobra taxa)
 
@@ -452,7 +452,7 @@ docker run --rm \
   --cpus=1 \
   --network=none \          ← sem rede (MCP usa proxy do host)
   --read-only \             ← filesystem read-only exceto /home e /workspace
-  claudeapi/sandbox \
+  claudecodeapi/sandbox \
   claude -p "mensagem" --output-format stream-json
 ```
 
@@ -528,7 +528,7 @@ POST /v1/chat/completions
 → output traduzido pro formato OpenAI SSE
 ```
 
-Isso permite que Cursor, Continue, LangChain, e qualquer app OpenAI-compatible use ClaudeAPI sem mudanca.
+Isso permite que Cursor, Continue, LangChain, e qualquer app OpenAI-compatible use ClaudeCodeAPI sem mudanca.
 
 ## Proximos passos
 
@@ -541,4 +541,4 @@ Isso permite que Cursor, Continue, LangChain, e qualquer app OpenAI-compatible u
 7. Session pool para cold start rapido
 8. Compatibilidade OpenAI format (POST /v1/chat/completions)
 9. Integrar como provider no SmoothAgent
-10. SDK: `npm install claudeapi`
+10. SDK: `npm install claudecodeapi`

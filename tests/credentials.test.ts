@@ -67,7 +67,7 @@ describe('setupCredentials', () => {
 
   before(async () => {
     origDataDir = config.dataDir;
-    tempDir = await mkdtemp(join(tmpdir(), 'claudeapi-test-'));
+    tempDir = await mkdtemp(join(tmpdir(), 'claudecodeapi-test-'));
     config.dataDir = tempDir;
   });
 

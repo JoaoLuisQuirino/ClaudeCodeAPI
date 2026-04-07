@@ -9,6 +9,7 @@ import { initSSE, sendJSON } from '../sse.js';
 import { log } from '../logger.js';
 import { randomUUID } from 'node:crypto';
 import { recordUsage } from '../db.js';
+import { validateModel } from '../validate.js';
 
 // ── Request types ─────────────────────────────────────────────────
 
@@ -74,10 +75,11 @@ export async function chatCompletionsHandler(req: IncomingMessage, res: ServerRe
     throw new BadRequestError('messages is required and must be a non-empty array');
   }
 
-  const model = mapModel(body.model);
+  const model = validateModel(mapModel(body.model));
   const { prompt, systemPrompt } = messagesToPrompt(body.messages);
   const streaming = body.stream === true; // OpenAI default is non-streaming
 
+  // Provider mode: single turn, no filesystem
   const { process: proc, cleanup } = await spawnWithQueue({
     prompt,
     userPaths: paths,
@@ -85,7 +87,7 @@ export async function chatCompletionsHandler(req: IncomingMessage, res: ServerRe
     model,
     systemPrompt,
     maxTurns: 1,
-    bare: true,
+    noFileAccess: true,
   });
 
   res.on('close', () => cleanup());
@@ -104,7 +106,7 @@ export async function chatCompletionsHandler(req: IncomingMessage, res: ServerRe
 
     parser.on('data', (event: ClaudeEvent) => translator.handleEvent(event));
     parser.on('end', () => {
-      recordUsage({ userHash, endpoint: '/v1/chat/completions', model, inputTokens: translator.usage.prompt_tokens, outputTokens: translator.usage.completion_tokens, costUsd: 0, durationMs: 0 });
+      recordUsage({ userHash, endpoint: '/v1/chat/completions', model, inputTokens: translator.usage.prompt_tokens, outputTokens: translator.usage.completion_tokens, costUsd: translator.cost, durationMs: translator.duration });
       translator.end();
       cleanup();
     });
@@ -130,6 +132,8 @@ export async function chatCompletionsHandler(req: IncomingMessage, res: ServerRe
       let text = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      let costUsd = 0;
+      let durationMs = 0;
 
       for (const ev of events) {
         if (ev.type === 'assistant' && ev.message?.content) {
@@ -140,13 +144,15 @@ export async function chatCompletionsHandler(req: IncomingMessage, res: ServerRe
         if (ev.type === 'content_block_delta' && ev.delta?.text) {
           text += ev.delta.text;
         }
-        if (ev.type === 'result' && ev.usage) {
-          if (ev.usage.input_tokens) inputTokens = ev.usage.input_tokens;
-          if (ev.usage.output_tokens) outputTokens = ev.usage.output_tokens;
+        if (ev.type === 'result') {
+          if (ev.usage?.input_tokens) inputTokens = ev.usage.input_tokens;
+          if (ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
+          if (ev.total_cost_usd) costUsd = ev.total_cost_usd;
+          if (ev.duration_ms) durationMs = ev.duration_ms;
         }
       }
 
-      recordUsage({ userHash, endpoint: '/v1/chat/completions', model, inputTokens, outputTokens, costUsd: 0, durationMs: 0 });
+      recordUsage({ userHash, endpoint: '/v1/chat/completions', model, inputTokens, outputTokens, costUsd, durationMs });
 
       const modelName = model.includes('opus') ? 'claude-opus-4-6'
         : model.includes('haiku') ? 'claude-haiku-4-5'

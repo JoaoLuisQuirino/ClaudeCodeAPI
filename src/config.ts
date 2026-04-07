@@ -36,6 +36,28 @@ export const config = {
   // Default model
   defaultModel: process.env.DEFAULT_MODEL || 'sonnet',
 
+  // Security
+  allowedModels: new Set((process.env.ALLOWED_MODELS || 'sonnet,opus,haiku,claude-sonnet-4-6,claude-opus-4-6,claude-haiku-4-5').split(',')),
+  corsOrigins: process.env.CORS_ORIGINS || '*',
+
   // Logging
   logLevel: (process.env.LOG_LEVEL || 'info') as 'debug' | 'info' | 'warn' | 'error',
+
+  // Per-user disk quota
+  maxUserDiskBytes: int(process.env.MAX_USER_DISK_BYTES, 500 * 1024 * 1024),
+
+  // Docker isolation
+  dockerIsolation: process.env.DOCKER_ISOLATION === 'true',
+  dockerImage: process.env.DOCKER_IMAGE || 'claudecodeapi/sandbox',
+  dockerMemory: process.env.DOCKER_MEMORY || '512m',
+  dockerCpus: process.env.DOCKER_CPUS || '1',
+
+  // Proxy trust
+  trustProxy: process.env.TRUST_PROXY === 'true',
 };
+
+// ── Config bounds validation ──────────────────────────────────────
+config.maxConcurrentGlobal = Math.max(1, Math.min(200, config.maxConcurrentGlobal));
+config.maxConcurrentPerUser = Math.max(1, Math.min(50, config.maxConcurrentPerUser));
+config.maxQueueSize = Math.max(1, Math.min(1000, config.maxQueueSize));
+config.processTimeoutMs = config.processTimeoutMs === 0 ? 0 : Math.max(10_000, Math.min(30 * 60_000, config.processTimeoutMs));

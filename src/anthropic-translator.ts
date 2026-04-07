@@ -22,6 +22,8 @@ export class AnthropicTranslator {
   private prevTextLen = 0; // track accumulated text for pattern A
   private inputTokens = 0;
   private outputTokens = 0;
+  private costUsd = 0;
+  private durationMs = 0;
   private textBuf = ''; // accumulate text for non-streaming collection
 
   constructor(res: ServerResponse, model: string) {
@@ -38,6 +40,9 @@ export class AnthropicTranslator {
   get usage(): { input_tokens: number; output_tokens: number } {
     return { input_tokens: this.inputTokens, output_tokens: this.outputTokens };
   }
+
+  get cost(): number { return this.costUsd; }
+  get duration(): number { return this.durationMs; }
 
   get messageId(): string {
     return this.msgId;
@@ -165,6 +170,8 @@ export class AnthropicTranslator {
           if (event.usage.input_tokens) this.inputTokens = event.usage.input_tokens;
           if (event.usage.output_tokens) this.outputTokens = event.usage.output_tokens;
         }
+        if (event.total_cost_usd) this.costUsd = event.total_cost_usd;
+        if (event.duration_ms) this.durationMs = event.duration_ms;
         break;
       }
 

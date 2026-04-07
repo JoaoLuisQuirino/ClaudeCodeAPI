@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { config } from './config.js';
 import { hashToken } from './hash.js';
 import { UnauthorizedError } from './errors.js';
@@ -58,12 +59,14 @@ export async function ensureUserDirs(paths: UserPaths): Promise<void> {
 }
 
 /**
- * Write the OAuth token so the claude binary can authenticate.
- * Creates user directories if they don't exist.
+ * Setup user credentials for the claude binary.
  *
- * The exact credential format may need adjustment based on the
- * Claude Code binary version. Currently writes the format used by
- * Claude Code's credential store.
+ * The token (accessToken) alone is NOT enough — the binary also requires
+ * a refreshToken. On first use, the user must POST to /auth/setup with
+ * their full credentials JSON. For subsequent requests, the accessToken
+ * in the Bearer header is used to identify the user (lookup by hash).
+ *
+ * If credentials already exist on disk for this user, we skip writing.
  */
 export async function setupCredentials(token: string): Promise<{ paths: UserPaths; userHash: string }> {
   const userHash = hashToken(token);
@@ -71,24 +74,57 @@ export async function setupCredentials(token: string): Promise<{ paths: UserPath
 
   await ensureUserDirs(paths);
 
-  // Write credentials in the format Claude Code expects
+  // If no credentials file, create a minimal one.
+  // Real auth requires POST /auth/login or POST /auth/setup first.
+  // Without refreshToken, the claude binary will respond "Not logged in".
   const credPath = join(paths.claudeDir, '.credentials.json');
-  const credData = JSON.stringify({
-    claudeAiOauth: {
-      accessToken: token,
-    },
-  }, null, 2);
-
-  await writeFile(credPath, credData, 'utf-8');
-
-  log('debug', 'Credentials written', { userHash });
+  if (!existsSync(credPath)) {
+    const credData = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: token,
+        refreshToken: '',
+        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        scopes: ['user:inference'],
+      },
+    }, null, 2);
+    await writeFile(credPath, credData, { encoding: 'utf-8', mode: 0o600 });
+    log('warn', 'Minimal credentials written — use POST /auth/login for full auth', { userHash });
+  }
 
   return { paths, userHash };
 }
 
 /**
+ * Write full credentials from the user's credential JSON.
+ * Called by POST /auth/setup with the content of ~/.claude/.credentials.json.
+ */
+export async function writeFullCredentials(
+  credentialsJson: Record<string, unknown>,
+): Promise<{ userHash: string }> {
+  // Extract accessToken to compute user hash
+  const oauth = credentialsJson.claudeAiOauth as Record<string, unknown> | undefined;
+  if (!oauth?.accessToken || typeof oauth.accessToken !== 'string') {
+    throw new UnauthorizedError('credentials must contain claudeAiOauth.accessToken');
+  }
+  if (!oauth.refreshToken || typeof oauth.refreshToken !== 'string') {
+    throw new UnauthorizedError('credentials must contain claudeAiOauth.refreshToken');
+  }
+
+  const token = oauth.accessToken;
+  const userHash = hashToken(token);
+  const paths = getUserPaths(token);
+
+  await ensureUserDirs(paths);
+
+  const credPath = join(paths.claudeDir, '.credentials.json');
+  await writeFile(credPath, JSON.stringify(credentialsJson, null, 2), { encoding: 'utf-8', mode: 0o600 });
+
+  log('info', 'Full credentials written', { userHash });
+  return { userHash };
+}
+
+/**
  * Fast path: resolve paths + hash without writing credentials.
- * Use when credentials were already set up for this token.
  */
 export function resolveUser(token: string): { paths: UserPaths; userHash: string } {
   return { paths: getUserPaths(token), userHash: hashToken(token) };

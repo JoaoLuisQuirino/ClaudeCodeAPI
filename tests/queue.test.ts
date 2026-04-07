@@ -37,7 +37,7 @@ let tempDir: string;
 const origConfig = { ...config };
 
 before(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'claudeapi-queue-'));
+  tempDir = await mkdtemp(join(tmpdir(), 'claudecodeapi-queue-'));
   config.dataDir = tempDir;
   config.claudeBinary = process.execPath;
   config.claudePrependArgs = [MOCK_CLAUDE];

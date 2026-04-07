@@ -80,7 +80,7 @@ let tempDir: string;
 const origConfig = { ...config };
 
 before(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'claudeapi-files-'));
+  tempDir = await mkdtemp(join(tmpdir(), 'claudecodeapi-files-'));
   config.dataDir = tempDir;
   config.claudeBinary = process.execPath;
   config.claudePrependArgs = [MOCK_CLAUDE];

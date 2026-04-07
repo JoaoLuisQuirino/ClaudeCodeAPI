@@ -1,11 +1,11 @@
 # ── Single node ────────────────────────────────────────────────────
 # Usage: caddy run --config Caddyfile
 #
-# Replace claudeapi.example.com with your domain, or use :443 for IP-only.
+# Replace claudecodeapi.example.com with your domain, or use :443 for IP-only.
 # Caddy handles TLS (Let's Encrypt) automatically.
 
-claudeapi.example.com {
-    # Reverse proxy to ClaudeAPI
+claudecodeapi.example.com {
+    # Reverse proxy to ClaudeCodeAPI
     reverse_proxy localhost:3456 {
         # Health-check: mark backend down if /health/ready fails
         health_uri    /health/ready
@@ -34,7 +34,7 @@ claudeapi.example.com {
 # ── Multi-node (horizontal scaling) ───────────────────────────────
 # Uncomment and adapt when scaling to multiple VPS.
 #
-# claudeapi.example.com {
+# claudecodeapi.example.com {
 #     reverse_proxy {
 #         to node1.internal:3456
 #         to node2.internal:3456

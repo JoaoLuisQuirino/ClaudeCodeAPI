@@ -173,22 +173,59 @@ class RequestQueue {
 
 export const queue = new RequestQueue();
 
+// ── Per-session lock ─────────────────────────────────────────────
+// Claude Code does NOT support concurrent access to the same session.
+// Two processes writing to the same session JSONL = corruption.
+// This lock ensures requests for the same session are serialized.
+
+const sessionLocks = new Map<string, Promise<void>>();
+
+async function acquireSessionLock(sessionId: string | undefined): Promise<() => void> {
+  if (!sessionId) return () => {}; // new sessions don't need locking
+
+  // Wait for any existing operation on this session
+  while (sessionLocks.has(sessionId)) {
+    await sessionLocks.get(sessionId);
+  }
+
+  // Create a lock that resolves when we release
+  let releaseLock: () => void;
+  const lockPromise = new Promise<void>(resolve => { releaseLock = resolve; });
+  sessionLocks.set(sessionId, lockPromise);
+
+  return () => {
+    sessionLocks.delete(sessionId);
+    releaseLock!();
+  };
+}
+
 // ── spawnWithQueue: queue-aware spawn ─────────────────────────────
 
 /**
- * Acquires a queue slot, spawns claude, and auto-releases the slot
- * when the process closes or cleanup is called.
+ * Acquires a queue slot + per-session lock, spawns claude, and
+ * auto-releases both when the process closes or cleanup is called.
  *
  * Drop-in replacement for spawnClaude in route handlers.
  */
 export async function spawnWithQueue(opts: SpawnClaudeOpts): Promise<SpawnResult> {
-  const ticket = await queue.acquire(opts.userHash);
+  // Per-session lock: serialize requests for the same session
+  const releaseSessionLock = await acquireSessionLock(opts.sessionId);
+
+  // Global + per-user concurrency slot
+  let ticket: QueueTicket;
+  try {
+    ticket = await queue.acquire(opts.userHash);
+  } catch (err) {
+    releaseSessionLock();
+    throw err;
+  }
 
   let result: SpawnResult;
   try {
     result = spawnClaude(opts);
   } catch (err) {
     queue.release(ticket);
+    releaseSessionLock();
     throw err;
   }
 
@@ -197,13 +234,14 @@ export async function spawnWithQueue(opts: SpawnClaudeOpts): Promise<SpawnResult
     if (!released) {
       released = true;
       queue.release(ticket);
+      releaseSessionLock();
     }
   };
 
   // Auto-release on process close
   result.process.on('close', releaseOnce);
 
-  // Wrap cleanup to also release slot
+  // Wrap cleanup to also release slot + session lock
   const origCleanup = result.cleanup;
   const wrappedCleanup = () => {
     origCleanup();

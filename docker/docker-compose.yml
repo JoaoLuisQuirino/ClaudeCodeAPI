@@ -1,14 +1,15 @@
 version: '3.8'
 
 services:
-  claudeapi:
+  claudecodeapi:
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
     ports:
       - "${PORT:-3456}:3456"
     volumes:
-      - claudeapi-data:/data
+      - claudecodeapi-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # Required for DOCKER_ISOLATION
     environment:
       - NODE_ENV=production
       - PORT=3456
@@ -19,6 +20,10 @@ services:
       - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-50}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-sonnet}
+      - DOCKER_ISOLATION=${DOCKER_ISOLATION:-false}
+      - DOCKER_IMAGE=${DOCKER_IMAGE:-claudecodeapi/sandbox}
+      - DOCKER_MEMORY=${DOCKER_MEMORY:-512m}
+      - DOCKER_CPUS=${DOCKER_CPUS:-1}
     restart: unless-stopped
     deploy:
       resources:
@@ -34,4 +39,4 @@ services:
       start_period: 10s
 
 volumes:
-  claudeapi-data:
+  claudecodeapi-data:

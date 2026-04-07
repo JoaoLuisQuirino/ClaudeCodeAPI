@@ -10,7 +10,7 @@ export function getDb(): Database.Database {
   if (db) return db;
 
   mkdirSync(config.dataDir, { recursive: true });
-  const dbPath = join(config.dataDir, 'claudeapi.db');
+  const dbPath = join(config.dataDir, 'claudecodeapi.db');
 
   db = new Database(dbPath);
 
@@ -54,6 +54,11 @@ function migrate(database: Database.Database): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_hash);
+
+    CREATE TABLE IF NOT EXISTS session_workspace_map (
+      claude_session_id TEXT PRIMARY KEY,
+      workspace_session_id TEXT NOT NULL
+    );
   `);
 }
 
@@ -176,17 +181,6 @@ export function dbUpdateSession(sessionId: string, updates: { status?: string; l
   }
 }
 
-export function dbRenameSession(oldId: string, newId: string): void {
-  try {
-    const database = getDb();
-    // Delete any existing entry with the new ID to avoid UNIQUE conflict
-    database.prepare(`DELETE FROM sessions WHERE session_id = ?`).run(newId);
-    database.prepare(`UPDATE sessions SET session_id = ? WHERE session_id = ?`).run(newId, oldId);
-  } catch (err) {
-    log('error', 'Failed to rename session', { error: err instanceof Error ? err.message : String(err) });
-  }
-}
-
 export function dbGetSessionsForUser(userHash: string): DbSession[] {
   try {
     return getDb().prepare(`SELECT * FROM sessions WHERE user_hash = ? ORDER BY last_active_at DESC`).all(userHash) as DbSession[];
@@ -206,6 +200,24 @@ export function dbDeleteSession(sessionId: string): void {
 export function dbLoadAllSessions(): DbSession[] {
   try {
     return getDb().prepare(`SELECT * FROM sessions WHERE status = 'active' OR status = 'completed'`).all() as DbSession[];
+  } catch {
+    return [];
+  }
+}
+
+// ── Session workspace mapping ────────────────────────────────────
+
+export function dbSaveWorkspaceMap(claudeSessionId: string, workspaceSessionId: string): void {
+  try {
+    getDb().prepare(`INSERT OR REPLACE INTO session_workspace_map (claude_session_id, workspace_session_id) VALUES (?, ?)`).run(claudeSessionId, workspaceSessionId);
+  } catch (err) {
+    log('error', 'Failed to save workspace map', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+export function dbLoadAllWorkspaceMaps(): Array<{ claude_session_id: string; workspace_session_id: string }> {
+  try {
+    return getDb().prepare(`SELECT * FROM session_workspace_map`).all() as Array<{ claude_session_id: string; workspace_session_id: string }>;
   } catch {
     return [];
   }

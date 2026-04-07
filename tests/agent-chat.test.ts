@@ -51,7 +51,7 @@ let tempDir: string;
 const origConfig = { ...config };
 
 before(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'claudeapi-agent-'));
+  tempDir = await mkdtemp(join(tmpdir(), 'claudecodeapi-agent-'));
   config.dataDir = tempDir;
   config.claudeBinary = process.execPath;
   config.claudePrependArgs = [MOCK_CLAUDE];
@@ -180,6 +180,49 @@ describe('POST /chat', () => {
     assert.equal(res2.status, 200);
     const body2 = JSON.parse(res2.body);
     assert.ok(body2.message);
+  });
+
+  it('CLAUDE.md and mcp-config persist across messages (stable cwd)', async () => {
+    const { existsSync } = await import('node:fs');
+    const { readFile } = await import('node:fs/promises');
+    const { hashToken } = await import('../src/hash.js');
+
+    const token = 'sk-ant-oat01-agent-test';
+    const userHash = hashToken(token);
+    const filesDir = join(tempDir, 'users', userHash, 'files');
+    const homeDir = join(tempDir, 'users', userHash, 'home');
+
+    // First message with context_md and mcp_config
+    const res1 = await httpReq('POST', '/chat', {
+      message: 'hello',
+      stream: false,
+      context_md: '# Test Context\nYou are a test agent.',
+      mcp_config: { mcpServers: { test: { type: 'http', url: 'http://localhost:9999' } } },
+    }, AUTH);
+    assert.equal(res1.status, 200);
+    const body1 = JSON.parse(res1.body);
+    assert.ok(body1.session_id);
+
+    // CLAUDE.md in files dir (stable cwd)
+    assert.ok(existsSync(join(filesDir, 'CLAUDE.md')), 'CLAUDE.md should be in files dir');
+    const claudeMd = await readFile(join(filesDir, 'CLAUDE.md'), 'utf-8');
+    assert.ok(claudeMd.includes('Test Context'));
+
+    // MCP config in home dir
+    assert.ok(existsSync(join(homeDir, 'mcp-config.json')), 'mcp-config should be in home dir');
+
+    // Second message — same session, cwd stays the same
+    const res2 = await httpReq('POST', '/chat', {
+      message: 'second',
+      session_id: body1.session_id,
+      stream: false,
+      mcp_config: { mcpServers: { test: { type: 'http', url: 'http://localhost:9999' } } },
+    }, AUTH);
+    assert.equal(res2.status, 200);
+
+    // Files still there
+    assert.ok(existsSync(join(filesDir, 'CLAUDE.md')), 'CLAUDE.md should persist');
+    assert.ok(existsSync(join(homeDir, 'mcp-config.json')), 'mcp-config should persist');
   });
 });
 

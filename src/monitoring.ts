@@ -1,6 +1,7 @@
 import { existsSync, statfsSync } from 'node:fs';
 import { config } from './config.js';
 import { queue } from './queue.js';
+import { VERSION } from './server.js';
 
 export interface HealthDetail {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -97,7 +98,7 @@ export function getFullHealth(): HealthDetail {
 
   return {
     status: allOk ? 'healthy' : anyFailed ? 'degraded' : 'unhealthy',
-    version: '0.1.0',
+    version: VERSION,
     uptime: Math.floor(process.uptime()),
     process: proc,
     queue: queueHealth,

@@ -3,7 +3,7 @@
 
 module.exports = {
   apps: [{
-    name: 'claudeapi',
+    name: 'claudecodeapi',
     script: 'dist/index.js',
     instances: 'max',            // 1 per CPU core
     exec_mode: 'cluster',
@@ -25,8 +25,8 @@ module.exports = {
     shutdown_with_message: true,
 
     // Logging
-    error_file: '/var/log/claudeapi/error.log',
-    out_file: '/var/log/claudeapi/out.log',
+    error_file: '/var/log/claudecodeapi/error.log',
+    out_file: '/var/log/claudecodeapi/out.log',
     merge_logs: true,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
 

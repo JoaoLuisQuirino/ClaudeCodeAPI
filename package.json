@@ -1,5 +1,5 @@
 {
-  "name": "claudeapi",
+  "name": "claudecodeapi",
   "version": "0.1.0",
   "description": "HTTP API over Claude Code binary — Provider + Agent modes",
   "type": "module",
@@ -11,16 +11,18 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "start:cluster": "CLUSTER_ENABLED=true node dist/index.js",
-    "test": "tsx --test tests/**/*.test.ts",
+    "test": "tsx --test tests/stream-parser.test.ts tests/credentials.test.ts tests/body-parser.test.ts tests/router.test.ts tests/anthropic-translator.test.ts tests/server.test.ts tests/agent-chat.test.ts tests/files.test.ts tests/openai-compat.test.ts tests/usage.test.ts tests/queue.test.ts tests/cluster.test.ts tests/health-deep.test.ts tests/security.test.ts tests/file-features.test.ts tests/auth-sessions.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/busboy": "^1.5.4",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0"
+    "better-sqlite3": "^12.8.0",
+    "busboy": "^1.6.0"
   }
 }

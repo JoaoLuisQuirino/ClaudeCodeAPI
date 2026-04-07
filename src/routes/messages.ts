@@ -8,6 +8,7 @@ import { AnthropicTranslator } from '../anthropic-translator.js';
 import { initSSE, sendJSON } from '../sse.js';
 import { log } from '../logger.js';
 import { recordUsage } from '../db.js';
+import { validateModel } from '../validate.js';
 
 // ── Request types ─────────────────────────────────────────────────
 
@@ -96,19 +97,19 @@ export async function messagesHandler(req: IncomingMessage, res: ServerResponse)
   }
 
   const prompt = messagesToPrompt(body.messages);
-  const model = body.model || 'sonnet';
+  const model = validateModel(body.model);
   const systemPrompt = extractSystemPrompt(body.system);
   const streaming = body.stream !== false; // default true for Provider mode
 
-  // Spawn claude process
+  // Spawn claude process — Provider mode: single turn, no filesystem
   const { process: proc, cleanup } = await spawnWithQueue({
     prompt,
     userPaths: paths,
     userHash,
     model,
     systemPrompt,
-    maxTurns: 1, // Provider mode: single turn, no agent loop
-    bare: true,   // Fast startup
+    maxTurns: 1,
+    noFileAccess: true,
   });
 
   // Handle client disconnect
@@ -135,7 +136,7 @@ export async function messagesHandler(req: IncomingMessage, res: ServerResponse)
 
     parser.on('end', () => {
       translator.end();
-      recordUsage({ userHash, endpoint: '/v1/messages', model, inputTokens: translator.usage.input_tokens, outputTokens: translator.usage.output_tokens, costUsd: 0, durationMs: 0 });
+      recordUsage({ userHash, endpoint: '/v1/messages', model, inputTokens: translator.usage.input_tokens, outputTokens: translator.usage.output_tokens, costUsd: translator.cost, durationMs: translator.duration });
       cleanup();
     });
 
@@ -165,12 +166,14 @@ export async function messagesHandler(req: IncomingMessage, res: ServerResponse)
       let text = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      let costUsd = 0;
+      let durationMs = 0;
 
       for (const ev of events) {
         if (ev.type === 'assistant' && ev.message?.content) {
           for (const block of ev.message.content) {
             if (block.type === 'text' && block.text) {
-              text = block.text; // last one has full accumulated text
+              text = block.text;
             }
           }
           if (ev.message.usage) {
@@ -181,13 +184,15 @@ export async function messagesHandler(req: IncomingMessage, res: ServerResponse)
         if (ev.type === 'content_block_delta' && ev.delta?.text) {
           text += ev.delta.text;
         }
-        if (ev.type === 'result' && ev.usage) {
-          if (ev.usage.input_tokens) inputTokens = ev.usage.input_tokens;
-          if (ev.usage.output_tokens) outputTokens = ev.usage.output_tokens;
+        if (ev.type === 'result') {
+          if (ev.usage?.input_tokens) inputTokens = ev.usage.input_tokens;
+          if (ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
+          if (ev.total_cost_usd) costUsd = ev.total_cost_usd;
+          if (ev.duration_ms) durationMs = ev.duration_ms;
         }
       }
 
-      recordUsage({ userHash, endpoint: '/v1/messages', model, inputTokens, outputTokens, costUsd: 0, durationMs: 0 });
+      recordUsage({ userHash, endpoint: '/v1/messages', model, inputTokens, outputTokens, costUsd, durationMs });
 
       sendJSON(res, 200, {
         id: `msg_${Date.now()}`,

@@ -30,7 +30,7 @@ export async function isDockerAvailable(): Promise<boolean> {
   }
 }
 
-const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'claudeapi/sandbox:latest';
+const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE || 'claudecodeapi/sandbox:latest';
 
 /**
  * Spawn claude inside an isolated Docker container.

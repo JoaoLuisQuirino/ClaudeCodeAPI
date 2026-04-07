@@ -4,9 +4,11 @@
  */
 
 import {
-  dbSaveSession, dbUpdateSession, dbRenameSession,
+  dbSaveSession, dbUpdateSession,
   dbGetSessionsForUser, dbDeleteSession, dbLoadAllSessions,
+  dbSaveWorkspaceMap, dbLoadAllWorkspaceMaps,
 } from './db.js';
+import { log } from './logger.js';
 
 export interface SessionInfo {
   sessionId: string;
@@ -20,7 +22,7 @@ export interface SessionInfo {
 const sessions = new Map<string, SessionInfo>();
 let loaded = false;
 
-/** Load sessions from DB on first access. */
+/** Load sessions and workspace map from DB on first access. */
 function ensureLoaded(): void {
   if (loaded) return;
   loaded = true;
@@ -35,6 +37,12 @@ function ensureLoaded(): void {
         lastActiveAt: new Date(row.last_active_at).getTime(),
         status: row.status as 'active' | 'completed' | 'error',
       });
+    }
+    // Load workspace mappings (bidirectional)
+    const maps = dbLoadAllWorkspaceMaps();
+    for (const m of maps) {
+      workspaceMap.set(m.claude_session_id, m.workspace_session_id);
+      claudeIdMap.set(m.workspace_session_id, m.claude_session_id);
     }
   } catch {
     // DB not ready yet — will work with in-memory only
@@ -70,15 +78,43 @@ export function completeSession(sessionId: string, status: 'completed' | 'error'
   dbUpdateSession(sessionId, { status });
 }
 
-export function renameSession(oldId: string, newId: string): void {
+/** Maps Claude's session_id → our workspace session_id */
+const workspaceMap = new Map<string, string>();
+/** Maps our workspace session_id → Claude's real session_id (for --continue) */
+const claudeIdMap = new Map<string, string>();
+
+/**
+ * Map a client session_id to Claude's real session_id.
+ * Always updates to the LATEST Claude ID — each --resume creates a new session
+ * with accumulated history, so we need the newest ID for the next --resume.
+ */
+export function renameSession(clientId: string, claudeId: string): void {
   ensureLoaded();
-  const s = sessions.get(oldId);
-  if (s && oldId !== newId) {
-    sessions.delete(oldId);
-    s.sessionId = newId;
-    sessions.set(newId, s);
-    dbRenameSession(oldId, newId);
+  if (clientId === claudeId) return;
+  // Clean up old mapping if exists
+  const oldClaudeId = claudeIdMap.get(clientId);
+  if (oldClaudeId) workspaceMap.delete(oldClaudeId);
+  // Always update to latest
+  workspaceMap.set(claudeId, clientId);
+  claudeIdMap.set(clientId, claudeId);
+  dbSaveWorkspaceMap(claudeId, clientId);
+  log('info', 'Session mapped', { clientId, claudeId, previousClaudeId: oldClaudeId || '(first)' });
+}
+
+/** Get Claude's real session_id for --resume.
+ *  The client may send any ID — we need Claude's actual ID. */
+export function getClaudeSessionId(sessionId: string): string | undefined {
+  // Direct: client sent our workspace ID → look up Claude's ID
+  const direct = claudeIdMap.get(sessionId);
+  if (direct) return direct;
+  // Client sent Claude's ID directly → use as-is
+  if (workspaceMap.has(sessionId)) return sessionId;
+  // Unknown ID — might be client's own ID. Check if any session has this as workspace.
+  // Walk the workspace map to find if this ID was stored as a workspace
+  for (const [claudeId, wsId] of workspaceMap) {
+    if (wsId === sessionId) return claudeId;
   }
+  return undefined;
 }
 
 export function getSession(sessionId: string): SessionInfo | undefined {
@@ -131,8 +167,26 @@ export function cleanupSessions(maxAgeMs: number): number {
     if (s.lastActiveAt < cutoff) {
       sessions.delete(id);
       dbDeleteSession(id);
+      // Clean up workspace map entries for this session
+      const claudeId = claudeIdMap.get(id);
+      if (claudeId) {
+        claudeIdMap.delete(id);
+        workspaceMap.delete(claudeId);
+      }
       cleaned++;
     }
   }
   return cleaned;
 }
+
+// ── Auto-cleanup: run every 30 minutes ────────────────────────────
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+const sessionCleanupTimer = setInterval(() => {
+  const cleaned = cleanupSessions(SESSION_MAX_AGE_MS);
+  if (cleaned > 0) {
+    log('info', `Session cleanup: removed ${cleaned} stale sessions`);
+  }
+}, 30 * 60 * 1000); // every 30 min
+
+sessionCleanupTimer.unref(); // don't prevent process exit

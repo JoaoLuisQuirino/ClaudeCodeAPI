@@ -20,6 +20,8 @@ export class OpenAITranslator {
   private textBuf = '';
   private inputTokens = 0;
   private outputTokens = 0;
+  private costUsd = 0;
+  private durationMs = 0;
 
   constructor(res: ServerResponse, model: string) {
     this.res = res;
@@ -35,6 +37,9 @@ export class OpenAITranslator {
       completion_tokens: this.outputTokens,
       total_tokens: this.inputTokens + this.outputTokens,
     };
+  }
+  get cost(): number { return this.costUsd; }
+  get duration(): number { return this.durationMs;
   }
   get completionId(): string { return this.id; }
 
@@ -119,6 +124,8 @@ export class OpenAITranslator {
           if (event.usage.input_tokens) this.inputTokens = event.usage.input_tokens;
           if (event.usage.output_tokens) this.outputTokens = event.usage.output_tokens;
         }
+        if (event.total_cost_usd) this.costUsd = event.total_cost_usd;
+        if (event.duration_ms) this.durationMs = event.duration_ms;
         break;
       }
 

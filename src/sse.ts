@@ -1,6 +1,6 @@
 import { ServerResponse } from 'node:http';
 
-/** Write SSE headers. Call once before any sendSSE/endSSE. */
+/** Write SSE headers + start keepalive pings. Call once before any sendSSE/endSSE. */
 export function initSSE(res: ServerResponse): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -8,6 +8,23 @@ export function initSSE(res: ServerResponse): void {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
+
+  // Keepalive: prevent proxies from killing idle connections during long thinking
+  let pingCount = 0;
+  const keepalive = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) {
+      const ok = res.write(':ping\n\n');
+      pingCount++;
+      if (pingCount <= 3 || pingCount % 10 === 0) {
+        console.log(`[sse] ping #${pingCount} sent, write ok: ${ok}`);
+      }
+    } else {
+      console.log(`[sse] ping skipped — res destroyed: ${res.destroyed}, ended: ${res.writableEnded}`);
+    }
+  }, 15_000);
+
+  // Clean up on close
+  res.on('close', () => clearInterval(keepalive));
 }
 
 /** Write a single SSE event. Returns false if the response is already closed. */

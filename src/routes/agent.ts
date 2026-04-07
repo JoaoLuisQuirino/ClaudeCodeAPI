@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { parseJsonBody } from '../body-parser.js';
 import { extractToken, setupCredentials } from '../credentials.js';
 import { BadRequestError, InternalError } from '../errors.js';
@@ -7,16 +9,20 @@ import { spawnWithQueue } from '../queue.js';
 import { ClaudeStreamParser, type ClaudeEvent } from '../stream-parser.js';
 import { initSSE, sendSSE, endSSE, sendJSON } from '../sse.js';
 import { log } from '../logger.js';
-import { trackSession, completeSession, renameSession } from '../sessions.js';
+import { trackSession, completeSession, renameSession, getClaudeSessionId } from '../sessions.js';
 import { recordUsage } from '../db.js';
+import { validateModel, validateSessionId } from '../validate.js';
 
 interface AgentRequest {
   task: string;
   session_id?: string;
   model?: string;
   system_prompt?: string;
+  context_md?: string;
   mcp_config?: Record<string, unknown>;
   max_turns?: number;
+  max_timeout?: number;
+  allow_network?: boolean;
   stream?: boolean;
 }
 
@@ -29,21 +35,38 @@ export async function agentHandler(req: IncomingMessage, res: ServerResponse): P
     throw new BadRequestError('task is required and must be a string');
   }
 
-  const sessionId = body.session_id || `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-  const model = body.model || 'sonnet';
+  validateSessionId(body.session_id);
+  const sessionId = body.session_id || `sess_${randomUUID().replace(/-/g, '')}`;
+  const model = validateModel(body.model);
   const streaming = body.stream !== false;
   const maxTurns = body.max_turns ?? 50;
 
-  // Write MCP config if provided
-  let mcpConfigPath: string | undefined;
+  // Validate MCP config if provided
   if (body.mcp_config) {
-    const { writeFile } = await import('node:fs/promises');
-    const { join } = await import('node:path');
-    mcpConfigPath = join(paths.home, 'mcp-config.json');
-    await writeFile(mcpConfigPath, JSON.stringify(body.mcp_config), 'utf-8');
+    if (typeof body.mcp_config !== 'object' || Array.isArray(body.mcp_config)) {
+      throw new BadRequestError('mcp_config must be a JSON object');
+    }
+    const cfg = body.mcp_config as Record<string, unknown>;
+    if (cfg.servers && (typeof cfg.servers !== 'object' || Array.isArray(cfg.servers))) {
+      throw new BadRequestError('mcp_config.servers must be a JSON object');
+    }
   }
 
   trackSession(sessionId, userHash, model);
+
+  // MCP config: write to user's home dir (stable path)
+  let mcpConfigPath: string | undefined;
+  if (body.mcp_config) {
+    mcpConfigPath = join(paths.home, 'mcp-config.json');
+    await writeFile(mcpConfigPath, JSON.stringify(body.mcp_config), { encoding: 'utf-8', mode: 0o600 });
+  }
+
+  // CLAUDE.md: write to user's files dir (stable cwd)
+  if (body.context_md) {
+    await writeFile(join(paths.files, 'CLAUDE.md'), body.context_md, 'utf-8');
+  }
+
+  const claudeSessionId = body.session_id ? getClaudeSessionId(body.session_id) || body.session_id : undefined;
 
   const { process: proc, cleanup } = await spawnWithQueue({
     prompt: body.task,
@@ -53,7 +76,9 @@ export async function agentHandler(req: IncomingMessage, res: ServerResponse): P
     systemPrompt: body.system_prompt,
     mcpConfigPath,
     maxTurns,
-    sessionId: body.session_id, // --continue only if user supplied existing session
+    timeoutMs: body.max_timeout,
+    sessionId: claudeSessionId,
+    allowNetwork: body.allow_network,
   });
 
   res.on('close', () => cleanup());
