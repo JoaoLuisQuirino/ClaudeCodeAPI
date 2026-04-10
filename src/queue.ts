@@ -132,8 +132,10 @@ class RequestQueue {
 
   private canGrant(userHash: string): boolean {
     if (this.activeGlobal >= this.maxSlots) return false;
-    const userActive = this.activePerUser.get(userHash) ?? 0;
-    if (userActive >= this.maxPerUser) return false;
+    if (this.maxPerUser > 0) {
+      const userActive = this.activePerUser.get(userHash) ?? 0;
+      if (userActive >= this.maxPerUser) return false;
+    }
     return true;
   }
 

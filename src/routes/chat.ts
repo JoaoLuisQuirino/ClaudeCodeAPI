@@ -22,6 +22,7 @@ interface ChatRequest {
   mcp_config?: Record<string, unknown>;
   max_turns?: number;
   max_timeout?: number;
+  timeout_ms?: number;
   allow_network?: boolean;
   stream?: boolean;
 }
@@ -80,7 +81,7 @@ export async function chatHandler(req: IncomingMessage, res: ServerResponse): Pr
     systemPrompt: body.system_prompt,
     sessionId: claudeSessionId,
     maxTurns: body.max_turns ?? 50,
-    timeoutMs: body.max_timeout,
+    timeoutMs: body.timeout_ms ?? body.max_timeout,
     mcpConfigPath,
     allowNetwork: body.allow_network,
   });

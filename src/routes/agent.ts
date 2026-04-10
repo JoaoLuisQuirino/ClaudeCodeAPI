@@ -22,6 +22,7 @@ interface AgentRequest {
   mcp_config?: Record<string, unknown>;
   max_turns?: number;
   max_timeout?: number;
+  timeout_ms?: number;     // alias for max_timeout
   allow_network?: boolean;
   stream?: boolean;
 }
@@ -76,7 +77,7 @@ export async function agentHandler(req: IncomingMessage, res: ServerResponse): P
     systemPrompt: body.system_prompt,
     mcpConfigPath,
     maxTurns,
-    timeoutMs: body.max_timeout,
+    timeoutMs: body.timeout_ms ?? body.max_timeout,
     sessionId: claudeSessionId,
     allowNetwork: body.allow_network,
   });

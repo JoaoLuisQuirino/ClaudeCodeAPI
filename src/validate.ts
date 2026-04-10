@@ -10,9 +10,10 @@ export function validateModel(model: string | undefined): string {
 
   if (config.allowedModels.has(m)) return m;
 
-  // Also accept models with version suffixes like "claude-sonnet-4-6-20251001"
+  // Accept models with version suffixes like "claude-sonnet-4-6-20251001"
+  // and full IDs when short names are in the list (e.g. "claude-sonnet-4-6" matches "sonnet")
   for (const allowed of config.allowedModels) {
-    if (m.startsWith(allowed)) return m;
+    if (m.startsWith(allowed) || m.includes(allowed)) return m;
   }
 
   throw new BadRequestError(`Model "${m}" is not allowed. Allowed: ${[...config.allowedModels].join(', ')}`);

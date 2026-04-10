@@ -13,7 +13,7 @@ export const config = {
 
   // Claude process limits
   maxConcurrentGlobal: int(process.env.MAX_CONCURRENT, 8),
-  maxConcurrentPerUser: int(process.env.MAX_CONCURRENT_PER_USER, 3),
+  maxConcurrentPerUser: int(process.env.MAX_CONCURRENT_PER_USER, 0), // 0 = no per-user limit
   processTimeoutMs: int(process.env.PROCESS_TIMEOUT_MS, 5 * 60 * 1000),
 
   // Queue
@@ -37,7 +37,7 @@ export const config = {
   defaultModel: process.env.DEFAULT_MODEL || 'sonnet',
 
   // Security
-  allowedModels: new Set((process.env.ALLOWED_MODELS || 'sonnet,opus,haiku,claude-sonnet-4-6,claude-opus-4-6,claude-haiku-4-5').split(',')),
+  allowedModels: new Set((process.env.ALLOWED_MODELS || 'sonnet,opus,haiku,claude-sonnet-4-6,claude-opus-4-6,claude-haiku-4-5,claude-sonnet-4-5,claude-opus-4-5').split(',')),
   corsOrigins: process.env.CORS_ORIGINS || '*',
 
   // Logging
