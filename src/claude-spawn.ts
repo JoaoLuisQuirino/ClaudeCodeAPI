@@ -37,24 +37,31 @@ export interface SpawnResult {
  * queue-aware spawning.
  */
 export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
+  const isResume = !!opts.sessionId;
+
   const claudeArgs: string[] = [
-    '-p', opts.prompt,
     '--output-format', 'stream-json',
     '--verbose',
     '--model', opts.model || config.defaultModel,
     '--permission-mode', 'bypassPermissions',
   ];
 
-  if (opts.bare) claudeArgs.push('--bare');
-  if (opts.sessionId) {
-    claudeArgs.push('--resume', opts.sessionId);
+  if (isResume) {
+    // --resume ignores -p, so we'll send the prompt via stdin
+    claudeArgs.push('--resume', opts.sessionId!);
     log('info', 'Session resume', {
       sessionId: opts.sessionId,
       userHash: opts.userHash,
       home: opts.userPaths.home,
       cwd: opts.userPaths.files,
+      promptLength: opts.prompt.length,
     });
+  } else {
+    // New session: use -p for the prompt
+    claudeArgs.push('-p', opts.prompt);
   }
+
+  if (opts.bare) claudeArgs.push('--bare');
   if (opts.systemPrompt) claudeArgs.push('--system-prompt', opts.systemPrompt);
   if (opts.maxTurns != null && opts.maxTurns > 0) claudeArgs.push('--max-turns', String(opts.maxTurns));
 
@@ -115,7 +122,7 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
     );
 
     proc = spawn('docker', dockerArgs, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [isResume ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
 
@@ -142,10 +149,16 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
         BROWSER: '',
         CI: '1',
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [isResume ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       cwd: hostWorkDir,
       windowsHide: true,
     });
+  }
+
+  // ── send prompt via stdin for --resume (since -p is ignored) ──
+  if (isResume && proc.stdin) {
+    proc.stdin.write(opts.prompt + '\n');
+    proc.stdin.end();
   }
 
   // ── stderr collection (bounded) ──
