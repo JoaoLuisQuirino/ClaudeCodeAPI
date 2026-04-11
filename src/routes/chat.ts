@@ -28,7 +28,7 @@ interface ChatRequest {
 }
 
 export async function chatHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths, userHash } = await setupCredentials(token);
 
   const body = await parseJsonBody<ChatRequest>(req);

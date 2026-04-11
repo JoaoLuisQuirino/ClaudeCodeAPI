@@ -6,7 +6,7 @@ import { getSessionsForUser, deleteSession, getSession } from '../sessions.js';
 import { NotFoundError } from '../errors.js';
 
 export async function listSessionsHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const userHash = hashToken(token);
   const sessions = getSessionsForUser(userHash);
 
@@ -26,7 +26,7 @@ export async function deleteSessionHandler(
   res: ServerResponse,
   params: Record<string, string>,
 ): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const userHash = hashToken(token);
   const sessionId = params.id;
 

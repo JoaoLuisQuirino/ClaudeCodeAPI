@@ -25,8 +25,11 @@ export interface UserPaths {
  * Extract Bearer token from Authorization header.
  * Throws UnauthorizedError on missing/invalid auth.
  */
-export function extractToken(authHeader: string | undefined): string {
-  if (!authHeader) throw new UnauthorizedError('Missing Authorization header');
+export function extractToken(authHeader: string | undefined, xApiKey?: string | undefined): string {
+  // Support both: Authorization: Bearer <token> and x-api-key: <token>
+  if (xApiKey) return xApiKey;
+
+  if (!authHeader) throw new UnauthorizedError('Missing Authorization header or x-api-key');
 
   const match = authHeader.match(/^Bearer\s+(\S+)$/i);
   if (!match?.[1]) throw new UnauthorizedError('Invalid Authorization format — expected "Bearer <token>"');

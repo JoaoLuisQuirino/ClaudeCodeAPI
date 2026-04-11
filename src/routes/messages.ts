@@ -85,7 +85,7 @@ function messagesToPrompt(messages: Message[]): string {
 
 export async function messagesHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Auth
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths, userHash } = await setupCredentials(token);
 
   // Parse body

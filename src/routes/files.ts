@@ -21,7 +21,7 @@ function resolveFilesDir(req: IncomingMessage, paths: { files: string; sessions:
 }
 
 export async function listFilesHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths } = await setupCredentials(token);
   const filesDir = resolveFilesDir(req, paths);
 
@@ -56,7 +56,7 @@ export async function deleteFileHandler(
   res: ServerResponse,
   params: Record<string, string>,
 ): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths, userHash } = await setupCredentials(token);
   const filesDir = resolveFilesDir(req, paths);
 
@@ -102,7 +102,7 @@ export async function downloadFileHandler(
   res: ServerResponse,
   params: Record<string, string>,
 ): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths } = await setupCredentials(token);
   const filesDir = resolveFilesDir(req, paths);
 

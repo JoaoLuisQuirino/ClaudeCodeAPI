@@ -5,7 +5,7 @@ import { sendJSON } from '../sse.js';
 import { getUsageForUser } from '../db.js';
 
 export async function usageHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const userHash = hashToken(token);
 
   // Parse ?limit=N from query string

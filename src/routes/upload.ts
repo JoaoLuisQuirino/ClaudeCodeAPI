@@ -11,7 +11,7 @@ import { checkQuota } from '../quota.js';
 import { validateSessionId } from '../validate.js';
 
 export async function uploadHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const token = extractToken(req.headers.authorization);
+  const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
   const { paths, userHash } = await setupCredentials(token);
 
   // If session_id provided, upload to session workspace instead of global files
