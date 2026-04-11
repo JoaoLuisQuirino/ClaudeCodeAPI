@@ -54,10 +54,11 @@ export function getUserPaths(token: string): UserPaths {
 // ── Directory + credential setup ──────────────────────────────────
 
 export async function ensureUserDirs(paths: UserPaths): Promise<void> {
+  // mode 0o755: Docker containers run as uid 1000 (claude user) and need read/exec access
   await Promise.all([
-    mkdir(paths.claudeDir, { recursive: true }),
-    mkdir(paths.files, { recursive: true }),
-    mkdir(paths.sessions, { recursive: true }),
+    mkdir(paths.claudeDir, { recursive: true, mode: 0o755 }),
+    mkdir(paths.files, { recursive: true, mode: 0o755 }),
+    mkdir(paths.sessions, { recursive: true, mode: 0o755 }),
   ]);
 }
 
@@ -90,7 +91,7 @@ export async function setupCredentials(token: string): Promise<{ paths: UserPath
         scopes: ['user:inference'],
       },
     }, null, 2);
-    await writeFile(credPath, credData, { encoding: 'utf-8', mode: 0o600 });
+    await writeFile(credPath, credData, { encoding: 'utf-8', mode: 0o644 });
     log('warn', 'Minimal credentials written — use POST /auth/login for full auth', { userHash });
   }
 
@@ -120,7 +121,7 @@ export async function writeFullCredentials(
   await ensureUserDirs(paths);
 
   const credPath = join(paths.claudeDir, '.credentials.json');
-  await writeFile(credPath, JSON.stringify(credentialsJson, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  await writeFile(credPath, JSON.stringify(credentialsJson, null, 2), { encoding: 'utf-8', mode: 0o644 });
 
   log('info', 'Full credentials written', { userHash });
   return { userHash };

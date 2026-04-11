@@ -59,7 +59,7 @@ export async function agentHandler(req: IncomingMessage, res: ServerResponse): P
   let mcpConfigPath: string | undefined;
   if (body.mcp_config) {
     mcpConfigPath = join(paths.home, 'mcp-config.json');
-    await writeFile(mcpConfigPath, JSON.stringify(body.mcp_config), { encoding: 'utf-8', mode: 0o600 });
+    await writeFile(mcpConfigPath, JSON.stringify(body.mcp_config), { encoding: 'utf-8', mode: 0o644 });
   }
 
   // CLAUDE.md: write to user's files dir (stable cwd)

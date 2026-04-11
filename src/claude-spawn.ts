@@ -91,8 +91,8 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
       // Resource limits
       '--memory', config.dockerMemory,
       '--cpus', config.dockerCpus,
-      // Network: none by default, bridge if explicitly allowed
-      '--network', opts.allowNetwork ? 'bridge' : 'none',
+      // Network: bridge by default (Claude CLI needs internet for API calls)
+      '--network', 'bridge',
       // Read-only root filesystem — can only write to mounted volumes
       '--read-only',
       // Tmpfs for claude's runtime needs
@@ -125,6 +125,7 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
       model: opts.model || config.defaultModel,
       memory: config.dockerMemory,
       cpus: config.dockerCpus,
+      promptLength: opts.prompt.length,
     });
   } else {
     // Direct spawn (no isolation — for solo use or trusted environments)
