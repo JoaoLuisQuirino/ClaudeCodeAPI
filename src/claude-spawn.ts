@@ -95,6 +95,7 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
 
     const dockerArgs = [
       'run', '--rm',
+      ...(isResume ? ['-i'] : []), // stdin forwarding for prompt via pipe
       // Resource limits
       '--memory', config.dockerMemory,
       '--cpus', config.dockerCpus,
