@@ -1,13 +1,13 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { spawn, execSync, ChildProcess } from 'node:child_process';
-import { join } from 'node:path';
+import { spawn, ChildProcess } from 'node:child_process';
+import { join, resolve } from 'node:path';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { parseJsonBody } from '../body-parser.js';
-import { writeFullCredentials } from '../credentials.js';
+import { extractToken, getUserPaths, writeFullCredentials } from '../credentials.js';
 import { sendJSON } from '../sse.js';
-import { BadRequestError } from '../errors.js';
+import { BadRequestError, UnauthorizedError } from '../errors.js';
 import { config } from '../config.js';
 import { log } from '../logger.js';
 import { hashToken } from '../hash.js';
@@ -24,6 +24,8 @@ interface PendingLogin {
   authUrl?: string;
   accessToken?: string;
   userHash?: string;
+  expiresAt?: number;
+  subscriptionType?: string;
   error?: string;
 }
 
@@ -130,7 +132,7 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
   });
 }
 
-// ── POST /auth/callback (receive auth code from client) ──────────
+// ── POST /auth/callback (receive auth code — synchronous) ────────
 
 export async function authCallbackHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await parseJsonBody<{ login_id: string; code: string }>(req);
@@ -150,10 +152,6 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
     return;
   }
 
-  login.status = 'pending';
-
-  log('info', 'Auth code received, exchanging...', { loginId: body.login_id });
-
   // Sanitize code to prevent shell injection
   const safeCode = body.code.replace(/[^a-zA-Z0-9_#\-]/g, '');
   if (safeCode !== body.code) {
@@ -163,81 +161,103 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
     return;
   }
 
-  // Exchange the code via shell pipe: echo "code" | claude auth login
-  // This spawns a NEW process (different code_challenge), but the pipe approach
-  // works reliably on Linux. On Windows, the original process handles it.
-  // We try both: pipe to original process, then shell fallback.
-  try {
-    // Try 1: pipe to the original process (works on Linux)
-    login.proc.stdin?.write(safeCode + '\n');
-    login.proc.stdin?.end();
+  login.status = 'pending';
+  log('info', 'Auth code received, exchanging...', { loginId: body.login_id });
 
-    // Try 2: shell fallback after a delay (works everywhere)
-    const fallbackTimer = setTimeout(() => {
-      try {
-        login.proc.kill();
-        execSync(`echo "${safeCode}" | ${config.claudeBinary} auth login`, {
-          env: { ...process.env, BROWSER: 'echo', DISPLAY: '' },
-          timeout: 15_000,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-      } catch { /* fallback failed — check credentials anyway */ }
-      checkCredentials();
-    }, 5000);
+  // Collect stderr from the original process for error reporting
+  let procStderr = '';
+  login.proc.stderr?.on('data', (chunk: Buffer) => {
+    procStderr += chunk.toString();
+    if (procStderr.length > 8192) procStderr = procStderr.slice(-4096);
+  });
 
-    // Watch for original process to complete
-    login.proc.on('close', () => {
-      clearTimeout(fallbackTimer);
-      checkCredentials();
+  // Pipe code to the original CLI process and wait for it to exit
+  login.proc.stdin?.write(safeCode + '\n');
+  login.proc.stdin?.end();
+
+  const exitCode = await waitForExit(login.proc, 30_000);
+
+  // Check credentials in all possible locations
+  const realHome = process.env.USERPROFILE || process.env.HOME || '';
+  const possiblePaths = [
+    login.credPath,
+    join(realHome, '.claude', '.credentials.json'),
+  ];
+
+  for (const credPath of possiblePaths) {
+    if (!existsSync(credPath)) continue;
+    try {
+      const raw = await readFile(credPath, 'utf-8');
+      const creds = JSON.parse(raw);
+      const token = creds.claudeAiOauth?.accessToken;
+      if (!token) continue;
+
+      await writeFullCredentials(creds);
+
+      login.status = 'completed';
+      login.accessToken = token;
+      login.userHash = hashToken(token);
+      login.expiresAt = creds.claudeAiOauth?.expiresAt;
+      login.subscriptionType = creds.claudeAiOauth?.subscriptionType;
+
+      log('info', 'OAuth login completed', { loginId: body.login_id, userHash: login.userHash, credPath });
+
+      // Clean up temp dir
+      rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
+
+      sendJSON(res, 200, {
+        status: 'completed',
+        access_token: login.accessToken,
+        user_hash: login.userHash,
+        expires_at: login.expiresAt ?? null,
+        subscription_type: login.subscriptionType ?? null,
+      });
+      pendingLogins.delete(body.login_id);
+      return;
+    } catch { /* can't read this path, try next */ }
+  }
+
+  // No credentials found — report the failure with stderr
+  login.status = 'error';
+  login.error = procStderr || 'No credentials found after code exchange';
+
+  log('error', 'Auth code exchange failed', {
+    loginId: body.login_id,
+    exitCode,
+    stderr: procStderr.slice(0, 500),
+  });
+
+  // Clean up temp dir
+  rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
+  pendingLogins.delete(body.login_id);
+
+  sendJSON(res, 502, {
+    status: 'error',
+    message: 'Code exchange failed. The auth code may be expired or invalid.',
+    stderr: procStderr || null,
+    exit_code: exitCode,
+  });
+}
+
+/** Wait for a child process to exit, with timeout. Returns exit code (null if killed). */
+function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<number | null> {
+  return new Promise((done) => {
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.kill('SIGTERM');
+      setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL'); }, 5000);
+      done(null);
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      done(code);
     });
-
-    // Also set a hard timeout
-    setTimeout(() => {
-      clearTimeout(fallbackTimer);
-      if (login.status === 'pending') {
-        login.proc.kill();
-        checkCredentials();
-      }
-    }, 20_000);
-  } catch (err) {
-    login.status = 'error';
-    login.error = err instanceof Error ? err.message : String(err);
-  }
-
-  async function checkCredentials() {
-    if (!login) return;
-    const realHome = process.env.USERPROFILE || process.env.HOME || '';
-    const possiblePaths = [
-      login.credPath,
-      join(realHome, '.claude', '.credentials.json'),
-    ];
-
-    for (const credPath of possiblePaths) {
-      if (!existsSync(credPath)) continue;
-      try {
-        const raw = await readFile(credPath, 'utf-8');
-        const creds = JSON.parse(raw);
-        const token = creds.claudeAiOauth?.accessToken;
-        if (token) {
-          await writeFullCredentials(creds);
-          login.status = 'completed';
-          login.accessToken = token;
-          login.userHash = hashToken(token);
-          log('info', 'OAuth login completed', { loginId: body.login_id, userHash: login.userHash, credPath });
-          return;
-        }
-      } catch { /* can't read this path */ }
-    }
-
-    if (login.status === 'pending') {
-      login.status = 'error';
-      login.error = 'No credentials found after login';
-    }
-  }
-
-  sendJSON(res, 202, {
-    status: 'processing',
-    message: 'Code received. Poll GET /auth/status/:login_id for the result.',
   });
 }
 
@@ -261,6 +281,8 @@ export async function authStatusHandler(
       status: 'completed',
       access_token: login.accessToken,
       user_hash: login.userHash,
+      expires_at: login.expiresAt ?? null,
+      subscription_type: login.subscriptionType ?? null,
       message: 'Use access_token as Bearer token for API requests.',
     });
     pendingLogins.delete(loginId);
@@ -284,5 +306,181 @@ export async function authStatusHandler(
     message: login.status === 'awaiting_code'
       ? 'Waiting for auth code. POST it to /auth/callback.'
       : 'Processing credentials...',
+  });
+}
+
+// ── POST /auth/refresh (token refresh via CLI) ───────────────────
+
+export async function authRefreshHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const token = extractToken(req.headers.authorization);
+  const userHash = hashToken(token);
+  const paths = getUserPaths(token);
+  const credPath = join(paths.claudeDir, '.credentials.json');
+
+  // 1. Read current credentials
+  if (!existsSync(credPath)) {
+    throw new UnauthorizedError('No credentials found for this token. Use POST /auth/login first.');
+  }
+
+  let creds: Record<string, any>;
+  try {
+    creds = JSON.parse(await readFile(credPath, 'utf-8'));
+  } catch {
+    throw new UnauthorizedError('Corrupt credentials file. Use POST /auth/login to re-authenticate.');
+  }
+
+  const oauth = creds.claudeAiOauth;
+  if (!oauth?.refreshToken) {
+    throw new UnauthorizedError('No refresh token on file. Use POST /auth/login to authenticate fully.');
+  }
+
+  // 2. If token is still fresh (>1h remaining), return current values without spawning CLI
+  const msRemaining = (oauth.expiresAt || 0) - Date.now();
+  if (msRemaining > 60 * 60 * 1000) {
+    sendJSON(res, 200, {
+      status: 'fresh',
+      access_token: oauth.accessToken,
+      expires_at: oauth.expiresAt,
+      subscription_type: oauth.subscriptionType ?? null,
+      message: 'Token still valid, no refresh needed.',
+    });
+    return;
+  }
+
+  // 3. Spawn CLI to trigger auto-refresh (minimal prompt, bare mode)
+  log('info', 'Triggering token refresh via CLI', { userHash });
+
+  const result = await spawnRefresh(paths.home, paths.files);
+
+  // 4. Re-read credentials after CLI ran
+  let refreshedCreds: Record<string, any>;
+  try {
+    refreshedCreds = JSON.parse(await readFile(credPath, 'utf-8'));
+  } catch {
+    sendJSON(res, 500, {
+      status: 'error',
+      message: 'Failed to read credentials after refresh attempt.',
+      stderr: result.stderr || null,
+    });
+    return;
+  }
+
+  const refreshedOauth = refreshedCreds.claudeAiOauth;
+  if (!refreshedOauth?.accessToken) {
+    sendJSON(res, 500, {
+      status: 'error',
+      message: 'Credentials file missing accessToken after refresh.',
+      stderr: result.stderr || null,
+    });
+    return;
+  }
+
+  // Check if the token actually changed or expiresAt was extended
+  const tokenChanged = refreshedOauth.accessToken !== oauth.accessToken;
+  const expiryExtended = (refreshedOauth.expiresAt || 0) > (oauth.expiresAt || 0);
+
+  if (!tokenChanged && !expiryExtended && result.exitCode !== 0) {
+    // CLI failed and credentials didn't change → refresh failed
+    sendJSON(res, 502, {
+      status: 'refresh_failed',
+      message: 'CLI could not refresh the token. Re-authentication may be required.',
+      stderr: result.stderr || null,
+    });
+    return;
+  }
+
+  log('info', 'Token refresh completed', {
+    userHash,
+    tokenChanged,
+    expiryExtended,
+    newExpiresAt: refreshedOauth.expiresAt,
+  });
+
+  sendJSON(res, 200, {
+    status: 'refreshed',
+    access_token: refreshedOauth.accessToken,
+    expires_at: refreshedOauth.expiresAt ?? null,
+    subscription_type: refreshedOauth.subscriptionType ?? null,
+    token_changed: tokenChanged,
+  });
+}
+
+// ── Spawn helper for refresh ─────────────────────────────────────
+
+function spawnRefresh(
+  homePath: string,
+  filesPath: string,
+): Promise<{ exitCode: number | null; stderr: string }> {
+  const absHome = resolve(homePath);
+  const absFiles = resolve(filesPath);
+
+  return new Promise((done) => {
+    let stderr = '';
+
+    const args: string[] = [
+      ...config.claudePrependArgs,
+      '-p', '.',
+      '--output-format', 'stream-json',
+      '--max-turns', '1',
+      '--bare',
+      '--permission-mode', 'bypassPermissions',
+    ];
+
+    let proc: ChildProcess;
+
+    if (config.dockerIsolation) {
+
+      proc = spawn('docker', [
+        'run', '--rm', '-t',
+        '--memory', config.dockerMemory,
+        '--cpus', config.dockerCpus,
+        '--network', 'bridge',
+        '--read-only',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
+        '-v', `${absHome}:/home/claude:rw`,
+        '-v', `${absFiles}:/workspace:rw`,
+        '-e', 'HOME=/home/claude',
+        '-e', 'CI=1',
+        '-w', '/workspace',
+        config.dockerImage,
+        ...args,
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } else {
+      proc = spawn(config.claudeBinary, args, {
+        env: {
+          ...process.env,
+          HOME: homePath,
+          USERPROFILE: homePath,
+          APPDATA: join(homePath, 'AppData', 'Roaming'),
+          DISPLAY: '',
+          BROWSER: '',
+          CI: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: filesPath,
+        windowsHide: true,
+      });
+    }
+
+    // Drain stdout (we don't need it, but must consume to avoid backpressure)
+    proc.stdout?.resume();
+
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf-8');
+      if (stderr.length > 8192) stderr = stderr.slice(-4096);
+    });
+
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM');
+      setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL'); }, 5000);
+    }, 30_000); // 30s max for a refresh
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      done({ exitCode: code, stderr: stderr.trim() });
+    });
   });
 }

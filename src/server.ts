@@ -21,7 +21,7 @@ import { uploadHandler } from './routes/upload.js';
 import { listFilesHandler, deleteFileHandler, downloadFileHandler } from './routes/files.js';
 import { chatCompletionsHandler } from './routes/chat-completions.js';
 import { usageHandler } from './routes/usage.js';
-import { authSetupHandler, authLoginHandler, authCallbackHandler, authStatusHandler } from './routes/auth.js';
+import { authSetupHandler, authLoginHandler, authCallbackHandler, authStatusHandler, authRefreshHandler } from './routes/auth.js';
 
 export interface AppServer {
   router: Router;
@@ -82,6 +82,7 @@ export function createApp(): AppServer {
   router.post('/auth/login', authLoginHandler);
   router.post('/auth/callback', authCallbackHandler);
   router.get('/auth/status/:login_id', authStatusHandler);
+  router.post('/auth/refresh', authRefreshHandler);
 
   // ── HTTP server ──
   const server = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
