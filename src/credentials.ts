@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { config } from './config.js';
 import { hashToken } from './hash.js';
 import { UnauthorizedError } from './errors.js';
@@ -82,7 +82,17 @@ export async function setupCredentials(token: string): Promise<{ paths: UserPath
   // Real auth requires POST /auth/login or POST /auth/setup first.
   // Without refreshToken, the claude binary will respond "Not logged in".
   const credPath = join(paths.claudeDir, '.credentials.json');
-  if (!existsSync(credPath)) {
+  if (existsSync(credPath)) {
+    // Update accessToken if it changed (user sent a new key)
+    try {
+      const existing = JSON.parse(readFileSync(credPath, 'utf-8'));
+      if (existing.claudeAiOauth?.accessToken !== token) {
+        existing.claudeAiOauth.accessToken = token;
+        await writeFile(credPath, JSON.stringify(existing, null, 2), { encoding: 'utf-8', mode: 0o644 });
+        log('info', 'Credentials updated with new accessToken', { userHash });
+      }
+    } catch { /* corrupt file — will be overwritten below */ }
+  } else {
     const credData = JSON.stringify({
       claudeAiOauth: {
         accessToken: token,
