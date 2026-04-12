@@ -1,7 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { writeFile as writeFileAsync } from 'node:fs/promises';
 import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { parseJsonBody } from '../body-parser.js';
 import { extractToken, setupCredentials } from '../credentials.js';
 import { BadRequestError, InternalError } from '../errors.js';
@@ -9,9 +10,10 @@ import { spawnWithQueue } from '../queue.js';
 import { ClaudeStreamParser, type ClaudeEvent } from '../stream-parser.js';
 import { initSSE, sendSSE, endSSE, sendJSON } from '../sse.js';
 import { log } from '../logger.js';
-import { trackSession, completeSession, touchSession, renameSession, getClaudeSessionId } from '../sessions.js';
+import { trackSession, completeSession, touchSession, renameSession, getClaudeSessionId, getSession } from '../sessions.js';
 import { recordUsage } from '../db.js';
 import { validateModel, validateSessionId } from '../validate.js';
+import { getUserPaths, ensureUserDirs } from '../credentials.js';
 
 interface ChatRequest {
   message: string;
@@ -29,7 +31,7 @@ interface ChatRequest {
 
 export async function chatHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const token = extractToken(req.headers.authorization, req.headers['x-api-key'] as string | undefined);
-  const { paths, userHash } = await setupCredentials(token);
+  const { paths: defaultPaths, userHash } = await setupCredentials(token);
 
   const body = await parseJsonBody<ChatRequest>(req);
   if (!body.message || typeof body.message !== 'string') {
@@ -38,16 +40,34 @@ export async function chatHandler(req: IncomingMessage, res: ServerResponse): Pr
 
   validateSessionId(body.session_id);
   const isNewSession = !body.session_id;
-  // Client's session_id — whatever they send, we accept as their key
   const clientSessionId = body.session_id || `sess_${randomUUID().replace(/-/g, '')}`;
   const model = validateModel(body.model);
   const streaming = body.stream !== false;
 
-  if (isNewSession) {
+  // When resuming a session, use the ORIGINAL user's directory (token may have changed)
+  let paths = defaultPaths;
+  if (!isNewSession) {
+    const existingSession = getSession(clientSessionId);
+    if (existingSession && existingSession.userHash !== userHash) {
+      // Token changed but same session — use original directory, update credentials there
+      const originalPaths = getUserPaths(existingSession.userHash);
+      await ensureUserDirs(originalPaths);
+      // Update credentials in the original directory with the new token
+      const credPath = join(originalPaths.claudeDir, '.credentials.json');
+      if (existsSync(credPath)) {
+        try {
+          const existing = JSON.parse(readFileSync(credPath, 'utf-8'));
+          existing.claudeAiOauth.accessToken = token;
+          await writeFileAsync(credPath, JSON.stringify(existing, null, 2), { encoding: 'utf-8', mode: 0o644 });
+          log('info', 'Updated credentials in original session dir', { clientSessionId, originalHash: existingSession.userHash, newHash: userHash });
+        } catch { /* will fail on spawn if creds are bad */ }
+      }
+      paths = originalPaths;
+    }
+    touchSession(clientSessionId);
+  } else {
     trackSession(clientSessionId, userHash, model);
     log('info', 'New chat session', { clientSessionId, userHash, model });
-  } else {
-    touchSession(clientSessionId);
   }
 
   // Resolve Claude's real session_id for --continue
@@ -57,12 +77,12 @@ export async function chatHandler(req: IncomingMessage, res: ServerResponse): Pr
   let mcpConfigPath: string | undefined;
   if (body.mcp_config) {
     mcpConfigPath = join(paths.home, 'mcp-config.json');
-    await writeFile(mcpConfigPath, JSON.stringify(body.mcp_config), { encoding: 'utf-8', mode: 0o644 });
+    await writeFileAsync(mcpConfigPath, JSON.stringify(body.mcp_config), { encoding: 'utf-8', mode: 0o644 });
   }
 
   // CLAUDE.md: write to user's files dir (stable cwd)
   if (isNewSession && body.context_md) {
-    await writeFile(join(paths.files, 'CLAUDE.md'), body.context_md, 'utf-8');
+    await writeFileAsync(join(paths.files, 'CLAUDE.md'), body.context_md, 'utf-8');
   }
 
   log('info', 'Chat session resolved', {

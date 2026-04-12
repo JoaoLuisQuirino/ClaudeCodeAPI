@@ -39,8 +39,9 @@ export function extractToken(authHeader: string | undefined, xApiKey?: string | 
 
 // ── User paths ────────────────────────────────────────────────────
 
-export function getUserPaths(token: string): UserPaths {
-  const hash = hashToken(token);
+export function getUserPaths(tokenOrHash: string): UserPaths {
+  // Accept either a raw token (will be hashed) or a pre-computed hash (32 hex chars)
+  const hash = /^[a-f0-9]{32}$/.test(tokenOrHash) ? tokenOrHash : hashToken(tokenOrHash);
   const userDir = join(config.dataDir, 'users', hash);
   const home = join(userDir, 'home');
   return {
