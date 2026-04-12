@@ -116,10 +116,9 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
     ];
 
     dockerArgs.push(
-      // Image
+      // Image (ENTRYPOINT is already "claude", don't duplicate)
       config.dockerImage,
-      // Claude command + args
-      'claude', ...claudeArgs,
+      ...claudeArgs,
     );
 
     proc = spawn('docker', dockerArgs, {
