@@ -1,50 +1,43 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { spawn, execSync, ChildProcess } from 'node:child_process';
-import { join, resolve } from 'node:path';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import * as pty from 'node-pty';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { parseJsonBody } from '../body-parser.js';
 import { extractToken, getUserPaths, writeFullCredentials } from '../credentials.js';
 import { sendJSON } from '../sse.js';
 import { BadRequestError, UnauthorizedError } from '../errors.js';
-import { config } from '../config.js';
 import { log } from '../logger.js';
 import { hashToken } from '../hash.js';
 
-/** Strip ANSI escape codes from PTY output */
-function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '');
+// ── OAuth constants (extracted from Claude Code binary) ──────────
+
+const OAUTH = {
+  CLIENT_ID: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+  AUTHORIZE_URL: 'https://claude.com/cai/oauth/authorize',
+  TOKEN_URL: 'https://platform.claude.com/v1/oauth/token',
+  REDIRECT_URI: 'https://platform.claude.com/oauth/code/callback',
+  SCOPES: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+};
+
+// ── PKCE helpers ─────────────────────────────────────────────────
+
+function generateCodeVerifier(): string {
+  return randomBytes(32).toString('base64url');
 }
 
-/** Resolve full path of a binary (pty.spawn doesn't search PATH on Windows) */
-let _resolvedClaude: string | undefined;
-function resolveClaudeBinary(): string {
-  if (_resolvedClaude) return _resolvedClaude;
-  try {
-    const cmd = process.platform === 'win32' ? 'where' : 'which';
-    _resolvedClaude = execSync(`${cmd} ${config.claudeBinary}`, { encoding: 'utf-8' }).trim().split(/\r?\n/)[0];
-  } catch {
-    _resolvedClaude = config.claudeBinary;
-  }
-  return _resolvedClaude;
+function generateCodeChallenge(verifier: string): string {
+  return createHash('sha256').update(verifier).digest('base64url');
 }
 
 // ── Pending login sessions ────────────────────────────────────────
 
 interface PendingLogin {
   loginId: string;
-  tempHome: string;
-  credPath: string;
-  ptyProc: ReturnType<typeof pty.spawn>;
-  ptyOutput: string;
-  ptyExited: boolean;
-  credWatcher?: ReturnType<typeof setInterval>;
+  codeVerifier: string;
   createdAt: number;
-  status: 'pending' | 'awaiting_authorization' | 'completed' | 'expired' | 'error';
-  authUrl?: string;
+  status: 'awaiting_code' | 'completed' | 'expired' | 'error';
+  authUrl: string;
   accessToken?: string;
   userHash?: string;
   expiresAt?: number;
@@ -58,10 +51,7 @@ const pendingLogins = new Map<string, PendingLogin>();
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, login] of pendingLogins) {
-    if (login.createdAt < cutoff) {
-      if (!login.ptyExited) login.ptyProc.kill();
-      pendingLogins.delete(id);
-    }
+    if (login.createdAt < cutoff) pendingLogins.delete(id);
   }
 }, 5 * 60 * 1000).unref();
 
@@ -83,154 +73,57 @@ export async function authSetupHandler(req: IncomingMessage, res: ServerResponse
   });
 }
 
-// ── POST /auth/login (start OAuth flow via PTY) ──────────────────
+// ── POST /auth/login (start OAuth PKCE flow) ─────────────────────
 
 export async function authLoginHandler(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   const loginId = randomUUID();
-  const tempHome = join(config.dataDir, 'auth-pending', loginId);
-  const claudeDir = join(tempHome, '.claude');
-  const credPath = join(claudeDir, '.credentials.json');
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
 
-  await mkdir(claudeDir, { recursive: true });
-
-  // Spawn claude auth login in a pseudo-terminal (CLI uses device flow polling)
-  const ptyProc = pty.spawn(resolveClaudeBinary(), ['auth', 'login'], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 24,
-    cwd: tempHome,
-    env: {
-      ...process.env,
-      HOME: tempHome,
-      USERPROFILE: tempHome,
-      DISPLAY: '',
-      BROWSER: 'echo',
-    },
+  const params = new URLSearchParams({
+    code: 'true',
+    client_id: OAUTH.CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: OAUTH.REDIRECT_URI,
+    scope: OAUTH.SCOPES,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state: loginId,
   });
+
+  const authUrl = `${OAUTH.AUTHORIZE_URL}?${params}`;
 
   const login: PendingLogin = {
     loginId,
-    tempHome,
-    credPath,
-    ptyProc,
-    ptyOutput: '',
-    ptyExited: false,
+    codeVerifier,
     createdAt: Date.now(),
-    status: 'pending',
-    authUrl: undefined,
+    status: 'awaiting_code',
+    authUrl,
   };
+  pendingLogins.set(loginId, login);
 
-  ptyProc.onData((data: string) => {
-    login.ptyOutput += data;
-    if (login.ptyOutput.length > 32768) login.ptyOutput = login.ptyOutput.slice(-16384);
-  });
+  // Auto-expire after 10 minutes
+  setTimeout(() => {
+    if (login.status === 'awaiting_code') login.status = 'expired';
+  }, 10 * 60 * 1000);
 
-  // Wait for auth URL to appear in PTY output (max 15s)
-  try {
-    const authUrl = await new Promise<string>((ok, fail) => {
-      const timeout = setTimeout(() => fail(new Error('Timeout waiting for auth URL')), 15000);
-      const check = setInterval(() => {
-        const clean = stripAnsi(login.ptyOutput);
-        const m = clean.match(/(https:\/\/claude\.(ai|com)\/[^\s\r\n]+)/);
-        if (m) {
-          clearInterval(check);
-          clearTimeout(timeout);
-          ok(m[1]);
-        }
-      }, 200);
-    });
-
-    login.authUrl = authUrl;
-    login.status = 'awaiting_authorization';
-    pendingLogins.set(loginId, login);
-  } catch {
-    ptyProc.kill();
-    throw new BadRequestError('Failed to generate login URL. Is the claude binary available?');
-  }
-
-  // Background credential watcher — polls every 2s for .credentials.json
-  const realHome = process.env.USERPROFILE || process.env.HOME || '';
-  const possibleCredPaths = [
-    credPath,
-    join(realHome, '.claude', '.credentials.json'),
-  ];
-
-  login.credWatcher = setInterval(() => {
-    if (login.status !== 'awaiting_authorization') {
-      clearInterval(login.credWatcher!);
-      return;
-    }
-    checkAndCompleteLogin(login, possibleCredPaths);
-  }, 2000);
-
-  // When PTY exits, do one final check then mark error if not completed
-  ptyProc.onExit(() => {
-    login.ptyExited = true;
-    setTimeout(() => {
-      if (login.status === 'awaiting_authorization') {
-        checkAndCompleteLogin(login, possibleCredPaths);
-        if (login.status === 'awaiting_authorization') {
-          login.status = 'error';
-          login.error = stripAnsi(login.ptyOutput).trim() || 'CLI exited without writing credentials';
-          log('error', 'CLI exited without credentials', { loginId });
-        }
-      }
-      if (login.credWatcher) clearInterval(login.credWatcher);
-    }, 1000);
-  });
-
-  // Auto-cleanup after 5 minutes
-  setTimeout(async () => {
-    if (login.credWatcher) clearInterval(login.credWatcher);
-    if (!login.ptyExited) ptyProc.kill();
-    if (login.status === 'awaiting_authorization') login.status = 'expired';
-    try { await rm(tempHome, { recursive: true, force: true }); } catch { /* best effort */ }
-  }, 5 * 60 * 1000);
+  log('info', 'OAuth login started', { loginId });
 
   sendJSON(res, 200, {
     login_id: loginId,
-    auth_url: login.authUrl,
-    message: 'Open auth_url in browser and authorize. Then call POST /auth/callback or poll GET /auth/status/:login_id.',
-    expires_in_seconds: 300,
+    auth_url: authUrl,
+    message: 'Open auth_url in browser, authorize, then POST the code to /auth/callback.',
+    expires_in_seconds: 600,
   });
 }
 
-/** Check credential files and mark login as completed if found */
-function checkAndCompleteLogin(login: PendingLogin, credPaths: string[]): void {
-  for (const p of credPaths) {
-    if (!existsSync(p)) continue;
-    try {
-      const raw = require('node:fs').readFileSync(p, 'utf-8');
-      const creds = JSON.parse(raw);
-      const token = creds.claudeAiOauth?.accessToken;
-      if (!token) continue;
-
-      // Write to permanent user dir (async, fire-and-forget — status updates sync)
-      writeFullCredentials(creds).catch(() => {});
-
-      login.status = 'completed';
-      login.accessToken = token;
-      login.userHash = hashToken(token);
-      login.expiresAt = creds.claudeAiOauth?.expiresAt;
-      login.subscriptionType = creds.claudeAiOauth?.subscriptionType;
-
-      log('info', 'OAuth login completed (device flow)', { loginId: login.loginId, userHash: login.userHash });
-
-      // Cleanup temp dir
-      rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
-      if (!login.ptyExited) login.ptyProc.kill();
-      return;
-    } catch { /* can't read, try next */ }
-  }
-}
-
-// ── POST /auth/callback (long-poll — wait for device flow) ──��────
+// ── POST /auth/callback (exchange code for tokens — synchronous) ─
 
 export async function authCallbackHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await parseJsonBody<{ login_id: string; code?: string }>(req);
+  const body = await parseJsonBody<{ login_id: string; code: string }>(req);
 
-  if (!body.login_id) {
-    throw new BadRequestError('login_id is required');
+  if (!body.login_id || !body.code) {
+    throw new BadRequestError('login_id and code are required');
   }
 
   const login = pendingLogins.get(body.login_id);
@@ -239,72 +132,103 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
     return;
   }
 
-  // Already completed? Return immediately.
-  if (login.status === 'completed') {
-    sendJSON(res, 200, {
-      status: 'completed',
-      access_token: login.accessToken,
-      user_hash: login.userHash,
-      expires_at: login.expiresAt ?? null,
-      subscription_type: login.subscriptionType ?? null,
+  if (login.status !== 'awaiting_code') {
+    sendJSON(res, 400, { status: login.status, message: `Login is ${login.status}, cannot accept code` });
+    return;
+  }
+
+  // Sanitize code
+  const safeCode = body.code.replace(/[^a-zA-Z0-9_#\-]/g, '');
+  if (safeCode !== body.code) {
+    login.status = 'error';
+    login.error = 'Invalid characters in auth code';
+    sendJSON(res, 400, { status: 'error', message: 'Invalid auth code format' });
+    return;
+  }
+
+  log('info', 'Exchanging auth code for tokens...', { loginId: body.login_id });
+
+  // Exchange code + code_verifier for tokens via Anthropic's token endpoint
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetch(OAUTH.TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'claude-cli/2.1.104 (external, cli)',
+      },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code: safeCode,
+        client_id: OAUTH.CLIENT_ID,
+        redirect_uri: OAUTH.REDIRECT_URI,
+        code_verifier: login.codeVerifier,
+        state: login.loginId,
+      }),
+    });
+  } catch (err) {
+    login.status = 'error';
+    login.error = `Network error calling token endpoint: ${err instanceof Error ? err.message : String(err)}`;
+    sendJSON(res, 502, { status: 'error', message: login.error });
+    pendingLogins.delete(body.login_id);
+    return;
+  }
+
+  const tokenData = await tokenResponse.json() as Record<string, unknown>;
+
+  if (!tokenResponse.ok) {
+    login.status = 'error';
+    login.error = `Token exchange failed: ${JSON.stringify(tokenData)}`;
+    log('error', 'Token exchange failed', { loginId: body.login_id, status: tokenResponse.status, body: tokenData });
+    sendJSON(res, 502, {
+      status: 'error',
+      message: 'Token exchange failed',
+      detail: tokenData,
     });
     pendingLogins.delete(body.login_id);
     return;
   }
 
-  // Already failed?
-  if (login.status === 'error') {
-    sendJSON(res, 502, { status: 'error', message: login.error || 'Login failed' });
+  // Extract tokens from response
+  const accessToken = tokenData.access_token as string;
+  const refreshToken = tokenData.refresh_token as string;
+  const expiresIn = tokenData.expires_in as number | undefined;
+
+  if (!accessToken) {
+    login.status = 'error';
+    login.error = 'Token response missing access_token';
+    sendJSON(res, 502, { status: 'error', message: login.error, detail: tokenData });
     pendingLogins.delete(body.login_id);
     return;
   }
 
-  if (login.status === 'expired') {
-    sendJSON(res, 410, { status: 'expired', message: 'Login session expired. Start a new one.' });
-    pendingLogins.delete(body.login_id);
-    return;
-  }
+  const expiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000;
 
-  // Long-poll: wait for status to change (max 120s)
-  log('info', 'Waiting for device flow completion...', { loginId: body.login_id });
+  // Write credentials in the format the claude binary expects
+  const credentials = {
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: refreshToken || '',
+      expiresAt,
+      scopes: OAUTH.SCOPES.split(' '),
+    },
+  };
 
-  const finalStatus = await new Promise<string>((done) => {
-    const timeout = setTimeout(() => done('timeout'), 120_000);
-    const check = setInterval(() => {
-      if (login.status !== 'awaiting_authorization' && login.status !== 'pending') {
-        clearInterval(check);
-        clearTimeout(timeout);
-        done(login.status);
-      }
-    }, 1000);
-  });
+  const { userHash } = await writeFullCredentials(credentials);
 
-  if (finalStatus === 'completed') {
-    sendJSON(res, 200, {
-      status: 'completed',
-      access_token: login.accessToken,
-      user_hash: login.userHash,
-      expires_at: login.expiresAt ?? null,
-      subscription_type: login.subscriptionType ?? null,
-    });
-    pendingLogins.delete(body.login_id);
-    return;
-  }
+  login.status = 'completed';
+  login.accessToken = accessToken;
+  login.userHash = userHash;
+  login.expiresAt = expiresAt;
 
-  if (finalStatus === 'timeout') {
-    sendJSON(res, 504, {
-      status: 'timeout',
-      message: 'Authorization not completed within 120s. User may not have authorized yet. Try again.',
-    });
-    return;
-  }
+  log('info', 'OAuth login completed (PKCE)', { loginId: body.login_id, userHash });
 
-  // error / expired
-  const output = stripAnsi(login.ptyOutput).trim();
-  sendJSON(res, 502, {
-    status: login.status,
-    message: login.error || 'Login failed',
-    output: output || null,
+  sendJSON(res, 200, {
+    status: 'completed',
+    access_token: accessToken,
+    user_hash: userHash,
+    expires_at: expiresAt,
+    subscription_type: login.subscriptionType ?? null,
   });
   pendingLogins.delete(body.login_id);
 }
@@ -351,13 +275,11 @@ export async function authStatusHandler(
 
   sendJSON(res, 202, {
     status: login.status,
-    message: login.status === 'awaiting_authorization'
-      ? 'Waiting for user to authorize in browser. CLI is polling.'
-      : 'Processing...',
+    message: 'Waiting for auth code. POST it to /auth/callback.',
   });
 }
 
-// ── POST /auth/refresh (token refresh via CLI) ───────────────────
+// ── POST /auth/refresh (token refresh via HTTP) ──────────────────
 
 export async function authRefreshHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const token = extractToken(req.headers.authorization);
@@ -382,7 +304,7 @@ export async function authRefreshHandler(req: IncomingMessage, res: ServerRespon
     throw new UnauthorizedError('No refresh token on file. Use POST /auth/login to authenticate fully.');
   }
 
-  // 2. If token is still fresh (>1h remaining), return current values without spawning CLI
+  // 2. If token is still fresh (>1h remaining), return current values
   const msRemaining = (oauth.expiresAt || 0) - Date.now();
   if (msRemaining > 60 * 60 * 1000) {
     sendJSON(res, 200, {
@@ -395,140 +317,66 @@ export async function authRefreshHandler(req: IncomingMessage, res: ServerRespon
     return;
   }
 
-  // 3. Spawn CLI to trigger auto-refresh (minimal prompt, bare mode)
-  log('info', 'Triggering token refresh via CLI', { userHash });
+  // 3. Refresh via HTTP (same token endpoint, different grant_type)
+  log('info', 'Refreshing token via HTTP', { userHash });
 
-  const result = await spawnRefresh(paths.home, paths.files);
-
-  // 4. Re-read credentials after CLI ran
-  let refreshedCreds: Record<string, any>;
+  let tokenResponse: Response;
   try {
-    refreshedCreds = JSON.parse(await readFile(credPath, 'utf-8'));
-  } catch {
-    sendJSON(res, 500, {
+    tokenResponse = await fetch(OAUTH.TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: oauth.refreshToken,
+        client_id: OAUTH.CLIENT_ID,
+      }),
+    });
+  } catch (err) {
+    sendJSON(res, 502, {
       status: 'error',
-      message: 'Failed to read credentials after refresh attempt.',
-      stderr: result.stderr || null,
+      message: `Network error: ${err instanceof Error ? err.message : String(err)}`,
     });
     return;
   }
 
-  const refreshedOauth = refreshedCreds.claudeAiOauth;
-  if (!refreshedOauth?.accessToken) {
-    sendJSON(res, 500, {
-      status: 'error',
-      message: 'Credentials file missing accessToken after refresh.',
-      stderr: result.stderr || null,
-    });
-    return;
-  }
+  const tokenData = await tokenResponse.json() as Record<string, unknown>;
 
-  // Check if the token actually changed or expiresAt was extended
-  const tokenChanged = refreshedOauth.accessToken !== oauth.accessToken;
-  const expiryExtended = (refreshedOauth.expiresAt || 0) > (oauth.expiresAt || 0);
-
-  if (!tokenChanged && !expiryExtended && result.exitCode !== 0) {
-    // CLI failed and credentials didn't change → refresh failed
+  if (!tokenResponse.ok) {
     sendJSON(res, 502, {
       status: 'refresh_failed',
-      message: 'CLI could not refresh the token. Re-authentication may be required.',
-      stderr: result.stderr || null,
+      message: 'Token refresh failed. Re-authentication may be required.',
+      detail: tokenData,
     });
     return;
   }
 
-  log('info', 'Token refresh completed', {
-    userHash,
-    tokenChanged,
-    expiryExtended,
-    newExpiresAt: refreshedOauth.expiresAt,
-  });
+  const newAccessToken = tokenData.access_token as string;
+  const newRefreshToken = tokenData.refresh_token as string;
+  const expiresIn = tokenData.expires_in as number | undefined;
+
+  if (!newAccessToken) {
+    sendJSON(res, 502, { status: 'error', message: 'Refresh response missing access_token' });
+    return;
+  }
+
+  const newExpiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000;
+
+  // Update credentials on disk
+  creds.claudeAiOauth.accessToken = newAccessToken;
+  if (newRefreshToken) creds.claudeAiOauth.refreshToken = newRefreshToken;
+  creds.claudeAiOauth.expiresAt = newExpiresAt;
+
+  await writeFile(credPath, JSON.stringify(creds, null, 2), { encoding: 'utf-8', mode: 0o644 });
+
+  const tokenChanged = newAccessToken !== oauth.accessToken;
+
+  log('info', 'Token refresh completed', { userHash, tokenChanged, newExpiresAt });
 
   sendJSON(res, 200, {
     status: 'refreshed',
-    access_token: refreshedOauth.accessToken,
-    expires_at: refreshedOauth.expiresAt ?? null,
-    subscription_type: refreshedOauth.subscriptionType ?? null,
+    access_token: newAccessToken,
+    expires_at: newExpiresAt,
+    subscription_type: oauth.subscriptionType ?? null,
     token_changed: tokenChanged,
-  });
-}
-
-// ── Spawn helper for refresh ─────────────────────────────────────
-
-function spawnRefresh(
-  homePath: string,
-  filesPath: string,
-): Promise<{ exitCode: number | null; stderr: string }> {
-  const absHome = resolve(homePath);
-  const absFiles = resolve(filesPath);
-
-  return new Promise((done) => {
-    let stderr = '';
-
-    const args: string[] = [
-      ...config.claudePrependArgs,
-      '-p', '.',
-      '--output-format', 'stream-json',
-      '--max-turns', '1',
-      '--bare',
-      '--permission-mode', 'bypassPermissions',
-    ];
-
-    let proc: ChildProcess;
-
-    if (config.dockerIsolation) {
-
-      proc = spawn('docker', [
-        'run', '--rm', '-t',
-        '--memory', config.dockerMemory,
-        '--cpus', config.dockerCpus,
-        '--network', 'bridge',
-        '--read-only',
-        '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
-        '-v', `${absHome}:/home/claude:rw`,
-        '-v', `${absFiles}:/workspace:rw`,
-        '-e', 'HOME=/home/claude',
-        '-e', 'CI=1',
-        '-w', '/workspace',
-        config.dockerImage,
-        ...args,
-      ], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      });
-    } else {
-      proc = spawn(config.claudeBinary, args, {
-        env: {
-          ...process.env,
-          HOME: homePath,
-          USERPROFILE: homePath,
-          APPDATA: join(homePath, 'AppData', 'Roaming'),
-          DISPLAY: '',
-          BROWSER: '',
-          CI: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: filesPath,
-        windowsHide: true,
-      });
-    }
-
-    // Drain stdout (we don't need it, but must consume to avoid backpressure)
-    proc.stdout?.resume();
-
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf-8');
-      if (stderr.length > 8192) stderr = stderr.slice(-4096);
-    });
-
-    const timer = setTimeout(() => {
-      proc.kill('SIGTERM');
-      setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL'); }, 5000);
-    }, 30_000); // 30s max for a refresh
-
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      done({ exitCode: code, stderr: stderr.trim() });
-    });
   });
 }
