@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import * as pty from 'node-pty';
 import { parseJsonBody } from '../body-parser.js';
 import { extractToken, getUserPaths, writeFullCredentials } from '../credentials.js';
 import { sendJSON } from '../sse.js';
@@ -12,13 +13,21 @@ import { config } from '../config.js';
 import { log } from '../logger.js';
 import { hashToken } from '../hash.js';
 
+/** Strip ANSI escape codes from PTY output */
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '');
+}
+
 // ── Pending login sessions ────────────────────────────────────────
 
 interface PendingLogin {
   loginId: string;
   tempHome: string;
   credPath: string;
-  proc: ChildProcess;
+  ptyProc: ReturnType<typeof pty.spawn>;
+  ptyOutput: string;
+  ptyExited: boolean;
   createdAt: number;
   status: 'pending' | 'awaiting_code' | 'completed' | 'expired' | 'error';
   authUrl?: string;
@@ -35,7 +44,10 @@ const pendingLogins = new Map<string, PendingLogin>();
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, login] of pendingLogins) {
-    if (login.createdAt < cutoff) pendingLogins.delete(id);
+    if (login.createdAt < cutoff) {
+      if (!login.ptyExited) login.ptyProc.kill();
+      pendingLogins.delete(id);
+    }
   }
 }, 5 * 60 * 1000).unref();
 
@@ -57,7 +69,7 @@ export async function authSetupHandler(req: IncomingMessage, res: ServerResponse
   });
 }
 
-// ── POST /auth/login (start OAuth flow) ───────────────────────────
+// ── POST /auth/login (start OAuth flow via PTY) ──────────────────
 
 export async function authLoginHandler(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   const loginId = randomUUID();
@@ -67,8 +79,12 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
 
   await mkdir(claudeDir, { recursive: true });
 
-  // Spawn claude auth login with stdin pipe (to send the auth code later)
-  const proc = spawn(config.claudeBinary, ['auth', 'login'], {
+  // Spawn claude auth login in a pseudo-terminal (CLI reads code from TTY, not stdin)
+  const ptyProc = pty.spawn(config.claudeBinary, ['auth', 'login'], {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 24,
+    cwd: tempHome,
     env: {
       ...process.env,
       HOME: tempHome,
@@ -76,57 +92,60 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
       DISPLAY: '',
       BROWSER: 'echo',
     },
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
   });
 
-  let stdout = '';
-  proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-  proc.stderr?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-
-  // Wait for URL to appear in output (max 15s)
-  const urlPromise = new Promise<string>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Timeout waiting for auth URL')), 15000);
-    const check = setInterval(() => {
-      const urlMatch = stdout.match(/(https:\/\/claude\.com\/[^\s]+)/);
-      if (urlMatch) {
-        clearInterval(check);
-        clearTimeout(timeout);
-        resolve(urlMatch[1]);
-      }
-    }, 200);
-  });
-
-  let authUrl: string;
-  try {
-    authUrl = await urlPromise;
-  } catch {
-    proc.kill();
-    throw new BadRequestError('Failed to generate login URL. Is the claude binary available?');
-  }
-
-  // Track this login session
+  // Shared mutable state — accumulated by onData, read by callback handler
   const login: PendingLogin = {
     loginId,
     tempHome,
     credPath,
-    proc,
+    ptyProc,
+    ptyOutput: '',
+    ptyExited: false,
     createdAt: Date.now(),
-    status: 'awaiting_code',
-    authUrl,
+    status: 'pending',
+    authUrl: undefined,
   };
-  pendingLogins.set(loginId, login);
+
+  ptyProc.onData((data: string) => {
+    login.ptyOutput += data;
+    if (login.ptyOutput.length > 32768) login.ptyOutput = login.ptyOutput.slice(-16384);
+  });
+  ptyProc.onExit(() => { login.ptyExited = true; });
+
+  // Wait for auth URL to appear in PTY output (max 15s)
+  try {
+    const authUrl = await new Promise<string>((ok, fail) => {
+      const timeout = setTimeout(() => fail(new Error('Timeout waiting for auth URL')), 15000);
+      const check = setInterval(() => {
+        const clean = stripAnsi(login.ptyOutput);
+        const m = clean.match(/(https:\/\/claude\.(ai|com)\/[^\s\r\n]+)/);
+        if (m) {
+          clearInterval(check);
+          clearTimeout(timeout);
+          ok(m[1]);
+        }
+      }, 200);
+    });
+
+    login.authUrl = authUrl;
+    login.status = 'awaiting_code';
+    pendingLogins.set(loginId, login);
+  } catch {
+    ptyProc.kill();
+    throw new BadRequestError('Failed to generate login URL. Is the claude binary available?');
+  }
 
   // Auto-cleanup after 10 minutes
   setTimeout(async () => {
-    proc.kill();
+    if (!login.ptyExited) ptyProc.kill();
     if (login.status === 'awaiting_code') login.status = 'expired';
     try { await rm(tempHome, { recursive: true, force: true }); } catch { /* best effort */ }
   }, 10 * 60 * 1000);
 
   sendJSON(res, 200, {
     login_id: loginId,
-    auth_url: authUrl,
+    auth_url: login.authUrl,
     message: 'Open auth_url in browser, authorize, then POST the auth code to /auth/callback.',
     expires_in_seconds: 600,
   });
@@ -162,20 +181,21 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
   }
 
   login.status = 'pending';
-  log('info', 'Auth code received, exchanging...', { loginId: body.login_id });
+  log('info', 'Auth code received, writing to PTY...', { loginId: body.login_id });
 
-  // Collect stderr from the original process for error reporting
-  let procStderr = '';
-  login.proc.stderr?.on('data', (chunk: Buffer) => {
-    procStderr += chunk.toString();
-    if (procStderr.length > 8192) procStderr = procStderr.slice(-4096);
-  });
+  // Write code to the pseudo-terminal (simulates user typing + Enter)
+  login.ptyProc.write(safeCode + '\r');
 
-  // Pipe code to the original CLI process and wait for it to exit
-  login.proc.stdin?.write(safeCode + '\n');
-  login.proc.stdin?.end();
-
-  const exitCode = await waitForExit(login.proc, 30_000);
+  // Wait for the PTY process to exit (timeout 30s)
+  if (!login.ptyExited) {
+    await new Promise<void>((done) => {
+      const timer = setTimeout(() => {
+        if (!login.ptyExited) login.ptyProc.kill();
+        done();
+      }, 30_000);
+      login.ptyProc.onExit(() => { clearTimeout(timer); done(); });
+    });
+  }
 
   // Check credentials in all possible locations
   const realHome = process.env.USERPROFILE || process.env.HOME || '';
@@ -217,14 +237,14 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
     } catch { /* can't read this path, try next */ }
   }
 
-  // No credentials found — report the failure with stderr
+  // No credentials found — report the failure with PTY output
+  const ptyOutput = stripAnsi(login.ptyOutput).trim();
   login.status = 'error';
-  login.error = procStderr || 'No credentials found after code exchange';
+  login.error = ptyOutput || 'No credentials found after code exchange';
 
   log('error', 'Auth code exchange failed', {
     loginId: body.login_id,
-    exitCode,
-    stderr: procStderr.slice(0, 500),
+    output: ptyOutput.slice(0, 500),
   });
 
   // Clean up temp dir
@@ -234,30 +254,7 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
   sendJSON(res, 502, {
     status: 'error',
     message: 'Code exchange failed. The auth code may be expired or invalid.',
-    stderr: procStderr || null,
-    exit_code: exitCode,
-  });
-}
-
-/** Wait for a child process to exit, with timeout. Returns exit code (null if killed). */
-function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<number | null> {
-  return new Promise((done) => {
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      proc.kill('SIGTERM');
-      setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL'); }, 5000);
-      done(null);
-    }, timeoutMs);
-
-    proc.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      done(code);
-    });
+    output: ptyOutput || null,
   });
 }
 
