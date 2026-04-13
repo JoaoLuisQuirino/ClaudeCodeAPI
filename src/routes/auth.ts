@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -17,6 +17,19 @@ import { hashToken } from '../hash.js';
 function stripAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '');
+}
+
+/** Resolve full path of a binary (pty.spawn doesn't search PATH on Windows) */
+let _resolvedClaude: string | undefined;
+function resolveClaudeBinary(): string {
+  if (_resolvedClaude) return _resolvedClaude;
+  try {
+    const cmd = process.platform === 'win32' ? 'where' : 'which';
+    _resolvedClaude = execSync(`${cmd} ${config.claudeBinary}`, { encoding: 'utf-8' }).trim().split(/\r?\n/)[0];
+  } catch {
+    _resolvedClaude = config.claudeBinary;
+  }
+  return _resolvedClaude;
 }
 
 // ── Pending login sessions ────────────────────────────────────────
@@ -80,7 +93,7 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
   await mkdir(claudeDir, { recursive: true });
 
   // Spawn claude auth login in a pseudo-terminal (CLI reads code from TTY, not stdin)
-  const ptyProc = pty.spawn(config.claudeBinary, ['auth', 'login'], {
+  const ptyProc = pty.spawn(resolveClaudeBinary(), ['auth', 'login'], {
     name: 'xterm-256color',
     cols: 120,
     rows: 24,
