@@ -41,8 +41,9 @@ interface PendingLogin {
   ptyProc: ReturnType<typeof pty.spawn>;
   ptyOutput: string;
   ptyExited: boolean;
+  credWatcher?: ReturnType<typeof setInterval>;
   createdAt: number;
-  status: 'pending' | 'awaiting_code' | 'completed' | 'expired' | 'error';
+  status: 'pending' | 'awaiting_authorization' | 'completed' | 'expired' | 'error';
   authUrl?: string;
   accessToken?: string;
   userHash?: string;
@@ -92,7 +93,7 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
 
   await mkdir(claudeDir, { recursive: true });
 
-  // Spawn claude auth login in a pseudo-terminal (CLI reads code from TTY, not stdin)
+  // Spawn claude auth login in a pseudo-terminal (CLI uses device flow polling)
   const ptyProc = pty.spawn(resolveClaudeBinary(), ['auth', 'login'], {
     name: 'xterm-256color',
     cols: 120,
@@ -107,7 +108,6 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
     },
   });
 
-  // Shared mutable state — accumulated by onData, read by callback handler
   const login: PendingLogin = {
     loginId,
     tempHome,
@@ -124,7 +124,6 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
     login.ptyOutput += data;
     if (login.ptyOutput.length > 32768) login.ptyOutput = login.ptyOutput.slice(-16384);
   });
-  ptyProc.onExit(() => { login.ptyExited = true; });
 
   // Wait for auth URL to appear in PTY output (max 15s)
   try {
@@ -142,35 +141,96 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
     });
 
     login.authUrl = authUrl;
-    login.status = 'awaiting_code';
+    login.status = 'awaiting_authorization';
     pendingLogins.set(loginId, login);
   } catch {
     ptyProc.kill();
     throw new BadRequestError('Failed to generate login URL. Is the claude binary available?');
   }
 
-  // Auto-cleanup after 10 minutes
+  // Background credential watcher — polls every 2s for .credentials.json
+  const realHome = process.env.USERPROFILE || process.env.HOME || '';
+  const possibleCredPaths = [
+    credPath,
+    join(realHome, '.claude', '.credentials.json'),
+  ];
+
+  login.credWatcher = setInterval(() => {
+    if (login.status !== 'awaiting_authorization') {
+      clearInterval(login.credWatcher!);
+      return;
+    }
+    checkAndCompleteLogin(login, possibleCredPaths);
+  }, 2000);
+
+  // When PTY exits, do one final check then mark error if not completed
+  ptyProc.onExit(() => {
+    login.ptyExited = true;
+    setTimeout(() => {
+      if (login.status === 'awaiting_authorization') {
+        checkAndCompleteLogin(login, possibleCredPaths);
+        if (login.status === 'awaiting_authorization') {
+          login.status = 'error';
+          login.error = stripAnsi(login.ptyOutput).trim() || 'CLI exited without writing credentials';
+          log('error', 'CLI exited without credentials', { loginId });
+        }
+      }
+      if (login.credWatcher) clearInterval(login.credWatcher);
+    }, 1000);
+  });
+
+  // Auto-cleanup after 5 minutes
   setTimeout(async () => {
+    if (login.credWatcher) clearInterval(login.credWatcher);
     if (!login.ptyExited) ptyProc.kill();
-    if (login.status === 'awaiting_code') login.status = 'expired';
+    if (login.status === 'awaiting_authorization') login.status = 'expired';
     try { await rm(tempHome, { recursive: true, force: true }); } catch { /* best effort */ }
-  }, 10 * 60 * 1000);
+  }, 5 * 60 * 1000);
 
   sendJSON(res, 200, {
     login_id: loginId,
     auth_url: login.authUrl,
-    message: 'Open auth_url in browser, authorize, then POST the auth code to /auth/callback.',
-    expires_in_seconds: 600,
+    message: 'Open auth_url in browser and authorize. Then call POST /auth/callback or poll GET /auth/status/:login_id.',
+    expires_in_seconds: 300,
   });
 }
 
-// ── POST /auth/callback (receive auth code — synchronous) ────────
+/** Check credential files and mark login as completed if found */
+function checkAndCompleteLogin(login: PendingLogin, credPaths: string[]): void {
+  for (const p of credPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const raw = require('node:fs').readFileSync(p, 'utf-8');
+      const creds = JSON.parse(raw);
+      const token = creds.claudeAiOauth?.accessToken;
+      if (!token) continue;
+
+      // Write to permanent user dir (async, fire-and-forget — status updates sync)
+      writeFullCredentials(creds).catch(() => {});
+
+      login.status = 'completed';
+      login.accessToken = token;
+      login.userHash = hashToken(token);
+      login.expiresAt = creds.claudeAiOauth?.expiresAt;
+      login.subscriptionType = creds.claudeAiOauth?.subscriptionType;
+
+      log('info', 'OAuth login completed (device flow)', { loginId: login.loginId, userHash: login.userHash });
+
+      // Cleanup temp dir
+      rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
+      if (!login.ptyExited) login.ptyProc.kill();
+      return;
+    } catch { /* can't read, try next */ }
+  }
+}
+
+// ── POST /auth/callback (long-poll — wait for device flow) ──��────
 
 export async function authCallbackHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await parseJsonBody<{ login_id: string; code: string }>(req);
+  const body = await parseJsonBody<{ login_id: string; code?: string }>(req);
 
-  if (!body.login_id || !body.code) {
-    throw new BadRequestError('login_id and code are required');
+  if (!body.login_id) {
+    throw new BadRequestError('login_id is required');
   }
 
   const login = pendingLogins.get(body.login_id);
@@ -179,96 +239,74 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
     return;
   }
 
-  if (login.status !== 'awaiting_code') {
-    sendJSON(res, 400, { status: login.status, message: `Login is ${login.status}, cannot accept code` });
-    return;
-  }
-
-  // Sanitize code to prevent shell injection
-  const safeCode = body.code.replace(/[^a-zA-Z0-9_#\-]/g, '');
-  if (safeCode !== body.code) {
-    login.status = 'error';
-    login.error = 'Invalid characters in auth code';
-    sendJSON(res, 400, { status: 'error', message: 'Invalid auth code format' });
-    return;
-  }
-
-  login.status = 'pending';
-  log('info', 'Auth code received, writing to PTY...', { loginId: body.login_id });
-
-  // Write code to the pseudo-terminal (simulates user typing + Enter)
-  login.ptyProc.write(safeCode + '\r');
-
-  // Wait for the PTY process to exit (timeout 30s)
-  if (!login.ptyExited) {
-    await new Promise<void>((done) => {
-      const timer = setTimeout(() => {
-        if (!login.ptyExited) login.ptyProc.kill();
-        done();
-      }, 30_000);
-      login.ptyProc.onExit(() => { clearTimeout(timer); done(); });
+  // Already completed? Return immediately.
+  if (login.status === 'completed') {
+    sendJSON(res, 200, {
+      status: 'completed',
+      access_token: login.accessToken,
+      user_hash: login.userHash,
+      expires_at: login.expiresAt ?? null,
+      subscription_type: login.subscriptionType ?? null,
     });
+    pendingLogins.delete(body.login_id);
+    return;
   }
 
-  // Check credentials in all possible locations
-  const realHome = process.env.USERPROFILE || process.env.HOME || '';
-  const possiblePaths = [
-    login.credPath,
-    join(realHome, '.claude', '.credentials.json'),
-  ];
-
-  for (const credPath of possiblePaths) {
-    if (!existsSync(credPath)) continue;
-    try {
-      const raw = await readFile(credPath, 'utf-8');
-      const creds = JSON.parse(raw);
-      const token = creds.claudeAiOauth?.accessToken;
-      if (!token) continue;
-
-      await writeFullCredentials(creds);
-
-      login.status = 'completed';
-      login.accessToken = token;
-      login.userHash = hashToken(token);
-      login.expiresAt = creds.claudeAiOauth?.expiresAt;
-      login.subscriptionType = creds.claudeAiOauth?.subscriptionType;
-
-      log('info', 'OAuth login completed', { loginId: body.login_id, userHash: login.userHash, credPath });
-
-      // Clean up temp dir
-      rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
-
-      sendJSON(res, 200, {
-        status: 'completed',
-        access_token: login.accessToken,
-        user_hash: login.userHash,
-        expires_at: login.expiresAt ?? null,
-        subscription_type: login.subscriptionType ?? null,
-      });
-      pendingLogins.delete(body.login_id);
-      return;
-    } catch { /* can't read this path, try next */ }
+  // Already failed?
+  if (login.status === 'error') {
+    sendJSON(res, 502, { status: 'error', message: login.error || 'Login failed' });
+    pendingLogins.delete(body.login_id);
+    return;
   }
 
-  // No credentials found — report the failure with PTY output
-  const ptyOutput = stripAnsi(login.ptyOutput).trim();
-  login.status = 'error';
-  login.error = ptyOutput || 'No credentials found after code exchange';
+  if (login.status === 'expired') {
+    sendJSON(res, 410, { status: 'expired', message: 'Login session expired. Start a new one.' });
+    pendingLogins.delete(body.login_id);
+    return;
+  }
 
-  log('error', 'Auth code exchange failed', {
-    loginId: body.login_id,
-    output: ptyOutput.slice(0, 500),
+  // Long-poll: wait for status to change (max 120s)
+  log('info', 'Waiting for device flow completion...', { loginId: body.login_id });
+
+  const finalStatus = await new Promise<string>((done) => {
+    const timeout = setTimeout(() => done('timeout'), 120_000);
+    const check = setInterval(() => {
+      if (login.status !== 'awaiting_authorization' && login.status !== 'pending') {
+        clearInterval(check);
+        clearTimeout(timeout);
+        done(login.status);
+      }
+    }, 1000);
   });
 
-  // Clean up temp dir
-  rm(login.tempHome, { recursive: true, force: true }).catch(() => {});
-  pendingLogins.delete(body.login_id);
+  if (finalStatus === 'completed') {
+    sendJSON(res, 200, {
+      status: 'completed',
+      access_token: login.accessToken,
+      user_hash: login.userHash,
+      expires_at: login.expiresAt ?? null,
+      subscription_type: login.subscriptionType ?? null,
+    });
+    pendingLogins.delete(body.login_id);
+    return;
+  }
 
+  if (finalStatus === 'timeout') {
+    sendJSON(res, 504, {
+      status: 'timeout',
+      message: 'Authorization not completed within 120s. User may not have authorized yet. Try again.',
+    });
+    return;
+  }
+
+  // error / expired
+  const output = stripAnsi(login.ptyOutput).trim();
   sendJSON(res, 502, {
-    status: 'error',
-    message: 'Code exchange failed. The auth code may be expired or invalid.',
-    output: ptyOutput || null,
+    status: login.status,
+    message: login.error || 'Login failed',
+    output: output || null,
   });
+  pendingLogins.delete(body.login_id);
 }
 
 // ── GET /auth/status/:login_id (poll for completion) ──────────────
@@ -313,9 +351,9 @@ export async function authStatusHandler(
 
   sendJSON(res, 202, {
     status: login.status,
-    message: login.status === 'awaiting_code'
-      ? 'Waiting for auth code. POST it to /auth/callback.'
-      : 'Processing credentials...',
+    message: login.status === 'awaiting_authorization'
+      ? 'Waiting for user to authorize in browser. CLI is polling.'
+      : 'Processing...',
   });
 }
 
