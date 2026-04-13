@@ -1,18 +1,18 @@
 FROM ubuntu:24.04
 
-# Minimal install: only what claude needs
+# Minimal install: only runtime deps the claude binary needs
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
-    && curl -fsSL https://cli.claude.ai/install.sh | sh \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user
-RUN useradd -m -s /bin/bash claude
+# Non-root user (uid 1000 matches typical host user)
+RUN useradd -m -u 1000 -s /bin/bash claude
 USER claude
 WORKDIR /workspace
 
+# claude binary is mounted from host at /usr/local/bin/claude
 ENTRYPOINT ["claude"]

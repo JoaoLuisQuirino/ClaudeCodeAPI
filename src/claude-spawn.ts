@@ -93,6 +93,11 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
     const homePath = resolve(opts.userPaths.home);
     const filesPath = resolve(opts.userPaths.files);
 
+    // Resolve host claude binary path to mount into container
+    const hostClaudeBin = config.claudeBinary.startsWith('/')
+      ? config.claudeBinary
+      : (() => { try { return require('node:child_process').execSync(`which ${config.claudeBinary}`, { encoding: 'utf-8' }).trim(); } catch { return '/usr/local/bin/claude'; } })();
+
     const dockerArgs = [
       'run', '--rm',
       '-t', // pseudo-TTY: forces line buffering for real-time streaming
@@ -104,8 +109,10 @@ export function spawnClaude(opts: SpawnClaudeOpts): SpawnResult {
       '--network', 'bridge',
       // Read-only root filesystem — can only write to mounted volumes
       '--read-only',
-      // Tmpfs for claude's runtime needs
-      '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
+      // Tmpfs for runtime needs (no noexec — CLI may need it)
+      '--tmpfs', '/tmp:rw,nosuid,size=64m',
+      // Mount host's claude binary (same version as host, always in sync)
+      '-v', `${hostClaudeBin}:/usr/local/bin/claude:ro`,
       // Mount ONLY this user's directories
       '-v', `${homePath}:/home/claude:rw`,
       '-v', `${filesPath}:/workspace:rw`,
