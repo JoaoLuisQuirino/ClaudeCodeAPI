@@ -2,6 +2,9 @@ import { ServerResponse } from 'node:http';
 
 /** Write SSE headers + start keepalive pings. Call once before any sendSSE/endSSE. */
 export function initSSE(res: ServerResponse): void {
+  // Disable Nagle — each write goes to TCP immediately instead of waiting up to 40ms
+  res.socket?.setNoDelay(true);
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
