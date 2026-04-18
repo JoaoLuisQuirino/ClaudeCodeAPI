@@ -1,12 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { randomUUID, randomBytes, createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { parseJsonBody } from '../body-parser.js';
 import { extractToken, getUserPaths, writeFullCredentials } from '../credentials.js';
-import { sendJSON } from '../sse.js';
 import { BadRequestError, UnauthorizedError } from '../errors.js';
+import { getRequestIp } from '../rate-limit.js';
 import { log } from '../logger.js';
 import { hashToken } from '../hash.js';
 
@@ -20,6 +20,71 @@ const OAUTH = {
   SCOPES: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
 };
 
+const UPSTREAM_TIMEOUT_MS = 10_000;
+const USER_AGENT = 'claude-cli/2.1.104 (external, cli)';
+
+// ── Response helper (no-store for all auth endpoints) ────────────
+
+function sendAuthJSON(res: ServerResponse, statusCode: number, body: unknown): void {
+  if (res.destroyed || res.writableEnded) return;
+  const payload = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+  });
+  res.end(payload);
+}
+
+// ── Internal key (shared secret for /auth/refresh-stateless) ─────
+
+let _internalKey: string | null | undefined;
+function getInternalKey(): string | null {
+  if (_internalKey !== undefined) return _internalKey;
+
+  if (process.env.INTERNAL_KEY) {
+    _internalKey = process.env.INTERNAL_KEY.trim();
+    return _internalKey || null;
+  }
+
+  try {
+    _internalKey = readFileSync('/etc/claudeapi/internal.key', 'utf-8').trim();
+    return _internalKey || null;
+  } catch {
+    _internalKey = null;
+    return null;
+  }
+}
+
+function checkInternalKey(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+// ── Rate limit for /auth/refresh-stateless (60/min per IP) ───────
+
+const refreshStatelessWindows = new Map<string, { count: number; resetAt: number }>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, w] of refreshStatelessWindows) {
+    if (w.resetAt <= now) refreshStatelessWindows.delete(ip);
+  }
+}, 60_000).unref();
+
+function checkRefreshRateLimit(ip: string): boolean {
+  const now = Date.now();
+  let w = refreshStatelessWindows.get(ip);
+  if (!w || w.resetAt <= now) {
+    w = { count: 0, resetAt: now + 60_000 };
+    refreshStatelessWindows.set(ip, w);
+  }
+  w.count++;
+  return w.count <= 60;
+}
+
 // ── PKCE helpers ─────────────────────────────────────────────────
 
 function generateCodeVerifier(): string {
@@ -28,6 +93,47 @@ function generateCodeVerifier(): string {
 
 function generateCodeChallenge(verifier: string): string {
   return createHash('sha256').update(verifier).digest('base64url');
+}
+
+// ── Upstream token call (shared by callback + refresh) ───────────
+
+type TokenEndpointResult =
+  | { ok: true; data: Record<string, unknown> }
+  | { ok: false; error_class: 'invalid_grant' | 'network' | 'timeout' | 'bad_response'; status?: number };
+
+async function callTokenEndpoint(body: Record<string, string>): Promise<TokenEndpointResult> {
+  let response: Response;
+  try {
+    response = await fetch(OAUTH.TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    return { ok: false, error_class: isTimeout ? 'timeout' : 'network' };
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    data = await response.json() as Record<string, unknown>;
+  } catch {
+    return { ok: false, error_class: 'bad_response', status: response.status };
+  }
+
+  if (!response.ok) {
+    return { ok: false, error_class: 'invalid_grant', status: response.status };
+  }
+
+  if (!data.access_token || typeof data.access_token !== 'string') {
+    return { ok: false, error_class: 'bad_response', status: response.status };
+  }
+
+  return { ok: true, data };
 }
 
 // ── Pending login sessions ────────────────────────────────────────
@@ -47,7 +153,6 @@ interface PendingLogin {
 
 const pendingLogins = new Map<string, PendingLogin>();
 
-// Cleanup expired logins every 5 minutes
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, login] of pendingLogins) {
@@ -66,7 +171,7 @@ export async function authSetupHandler(req: IncomingMessage, res: ServerResponse
 
   const { userHash } = await writeFullCredentials(body);
 
-  sendJSON(res, 200, {
+  sendAuthJSON(res, 200, {
     status: 'ok',
     message: 'Credentials stored. Use your accessToken as Bearer token for API requests.',
     userHash,
@@ -102,14 +207,13 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
   };
   pendingLogins.set(loginId, login);
 
-  // Auto-expire after 10 minutes
   setTimeout(() => {
     if (login.status === 'awaiting_code') login.status = 'expired';
   }, 10 * 60 * 1000);
 
-  log('info', 'OAuth login started', { loginId });
+  log('info', 'oauth_login', { outcome: 'started', loginId });
 
-  sendJSON(res, 200, {
+  sendAuthJSON(res, 200, {
     login_id: loginId,
     auth_url: authUrl,
     message: 'Open auth_url in browser, authorize, then POST the code to /auth/callback.',
@@ -117,7 +221,7 @@ export async function authLoginHandler(_req: IncomingMessage, res: ServerRespons
   });
 }
 
-// ── POST /auth/callback (exchange code for tokens — synchronous) ─
+// ── POST /auth/callback (exchange code for tokens) ───────────────
 
 export async function authCallbackHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await parseJsonBody<{ login_id: string; code: string }>(req);
@@ -128,87 +232,52 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
 
   const login = pendingLogins.get(body.login_id);
   if (!login) {
-    sendJSON(res, 404, { status: 'not_found', message: 'Login session not found or expired' });
+    sendAuthJSON(res, 404, { status: 'not_found', message: 'Login session not found or expired' });
     return;
   }
 
   if (login.status !== 'awaiting_code') {
-    sendJSON(res, 400, { status: login.status, message: `Login is ${login.status}, cannot accept code` });
+    sendAuthJSON(res, 400, { status: login.status, message: `Login is ${login.status}, cannot accept code` });
     return;
   }
 
-  // Sanitize code
   const safeCode = body.code.replace(/[^a-zA-Z0-9_#\-]/g, '');
   if (safeCode !== body.code) {
     login.status = 'error';
     login.error = 'Invalid characters in auth code';
-    sendJSON(res, 400, { status: 'error', message: 'Invalid auth code format' });
+    sendAuthJSON(res, 400, { status: 'error', message: 'Invalid auth code format' });
     return;
   }
 
-  log('info', 'Exchanging auth code for tokens...', { loginId: body.login_id });
+  const result = await callTokenEndpoint({
+    grant_type: 'authorization_code',
+    code: safeCode,
+    client_id: OAUTH.CLIENT_ID,
+    redirect_uri: OAUTH.REDIRECT_URI,
+    code_verifier: login.codeVerifier,
+    state: login.loginId,
+  });
 
-  // Exchange code + code_verifier for tokens via Anthropic's token endpoint
-  let tokenResponse: Response;
-  try {
-    tokenResponse = await fetch(OAUTH.TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'claude-cli/2.1.104 (external, cli)',
-      },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        code: safeCode,
-        client_id: OAUTH.CLIENT_ID,
-        redirect_uri: OAUTH.REDIRECT_URI,
-        code_verifier: login.codeVerifier,
-        state: login.loginId,
-      }),
-    });
-  } catch (err) {
+  if (!result.ok) {
     login.status = 'error';
-    login.error = `Network error calling token endpoint: ${err instanceof Error ? err.message : String(err)}`;
-    sendJSON(res, 502, { status: 'error', message: login.error });
+    login.error = result.error_class;
+    log('info', 'oauth_callback', { outcome: 'fail', loginId: body.login_id, error_class: result.error_class, status: result.status });
+    const code = result.error_class === 'invalid_grant' ? 401 : 502;
+    sendAuthJSON(res, code, { status: 'error', error: result.error_class });
     pendingLogins.delete(body.login_id);
     return;
   }
 
-  const tokenData = await tokenResponse.json() as Record<string, unknown>;
+  const accessToken = result.data.access_token as string;
+  const refreshToken = (result.data.refresh_token as string) || '';
+  const expiresIn = result.data.expires_in as number | undefined;
+  const expiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 8 * 60 * 60 * 1000;
 
-  if (!tokenResponse.ok) {
-    login.status = 'error';
-    login.error = `Token exchange failed: ${JSON.stringify(tokenData)}`;
-    log('error', 'Token exchange failed', { loginId: body.login_id, status: tokenResponse.status, body: tokenData });
-    sendJSON(res, 502, {
-      status: 'error',
-      message: 'Token exchange failed',
-      detail: tokenData,
-    });
-    pendingLogins.delete(body.login_id);
-    return;
-  }
-
-  // Extract tokens from response
-  const accessToken = tokenData.access_token as string;
-  const refreshToken = tokenData.refresh_token as string;
-  const expiresIn = tokenData.expires_in as number | undefined;
-
-  if (!accessToken) {
-    login.status = 'error';
-    login.error = 'Token response missing access_token';
-    sendJSON(res, 502, { status: 'error', message: login.error, detail: tokenData });
-    pendingLogins.delete(body.login_id);
-    return;
-  }
-
-  const expiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000;
-
-  // Write credentials in the format the claude binary expects
+  // Write credentials to disk (keeps /auth/refresh legado working during transition)
   const credentials = {
     claudeAiOauth: {
       accessToken,
-      refreshToken: refreshToken || '',
+      refreshToken,
       expiresAt,
       scopes: OAUTH.SCOPES.split(' '),
     },
@@ -221,11 +290,12 @@ export async function authCallbackHandler(req: IncomingMessage, res: ServerRespo
   login.userHash = userHash;
   login.expiresAt = expiresAt;
 
-  log('info', 'OAuth login completed (PKCE)', { loginId: body.login_id, userHash });
+  log('info', 'oauth_callback', { outcome: 'ok', loginId: body.login_id, userHash });
 
-  sendJSON(res, 200, {
+  sendAuthJSON(res, 200, {
     status: 'completed',
     access_token: accessToken,
+    refresh_token: refreshToken,
     user_hash: userHash,
     expires_at: expiresAt,
     subscription_type: login.subscriptionType ?? null,
@@ -244,12 +314,12 @@ export async function authStatusHandler(
   const login = pendingLogins.get(loginId);
 
   if (!login) {
-    sendJSON(res, 404, { status: 'not_found', message: 'Login session not found or expired' });
+    sendAuthJSON(res, 404, { status: 'not_found', message: 'Login session not found or expired' });
     return;
   }
 
   if (login.status === 'completed') {
-    sendJSON(res, 200, {
+    sendAuthJSON(res, 200, {
       status: 'completed',
       access_token: login.accessToken,
       user_hash: login.userHash,
@@ -262,24 +332,24 @@ export async function authStatusHandler(
   }
 
   if (login.status === 'expired') {
-    sendJSON(res, 410, { status: 'expired', message: 'Login session expired. Start a new one.' });
+    sendAuthJSON(res, 410, { status: 'expired', message: 'Login session expired. Start a new one.' });
     pendingLogins.delete(loginId);
     return;
   }
 
   if (login.status === 'error') {
-    sendJSON(res, 500, { status: 'error', message: login.error || 'Unknown error during login' });
+    sendAuthJSON(res, 500, { status: 'error', error: login.error || 'unknown' });
     pendingLogins.delete(loginId);
     return;
   }
 
-  sendJSON(res, 202, {
+  sendAuthJSON(res, 202, {
     status: login.status,
     message: 'Waiting for auth code. POST it to /auth/callback.',
   });
 }
 
-// ── POST /auth/refresh (token refresh via HTTP) ──────────────────
+// ── POST /auth/refresh (legado — reads refresh_token from disk) ──
 
 export async function authRefreshHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const token = extractToken(req.headers.authorization);
@@ -287,7 +357,6 @@ export async function authRefreshHandler(req: IncomingMessage, res: ServerRespon
   const paths = getUserPaths(token);
   const credPath = join(paths.claudeDir, '.credentials.json');
 
-  // 1. Read current credentials
   if (!existsSync(credPath)) {
     throw new UnauthorizedError('No credentials found for this token. Use POST /auth/login first.');
   }
@@ -304,10 +373,10 @@ export async function authRefreshHandler(req: IncomingMessage, res: ServerRespon
     throw new UnauthorizedError('No refresh token on file. Use POST /auth/login to authenticate fully.');
   }
 
-  // 2. If token is still fresh (>1h remaining), return current values
+  // Skip refresh if token is still fresh (>1h remaining)
   const msRemaining = (oauth.expiresAt || 0) - Date.now();
   if (msRemaining > 60 * 60 * 1000) {
-    sendJSON(res, 200, {
+    sendAuthJSON(res, 200, {
       status: 'fresh',
       access_token: oauth.accessToken,
       expires_at: oauth.expiresAt,
@@ -317,66 +386,108 @@ export async function authRefreshHandler(req: IncomingMessage, res: ServerRespon
     return;
   }
 
-  // 3. Refresh via HTTP (same token endpoint, different grant_type)
-  log('info', 'Refreshing token via HTTP', { userHash });
+  const result = await callTokenEndpoint({
+    grant_type: 'refresh_token',
+    refresh_token: oauth.refreshToken,
+    client_id: OAUTH.CLIENT_ID,
+  });
 
-  let tokenResponse: Response;
-  try {
-    tokenResponse = await fetch(OAUTH.TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: oauth.refreshToken,
-        client_id: OAUTH.CLIENT_ID,
-      }),
-    });
-  } catch (err) {
-    sendJSON(res, 502, {
-      status: 'error',
-      message: `Network error: ${err instanceof Error ? err.message : String(err)}`,
-    });
+  if (!result.ok) {
+    log('info', 'oauth_refresh', { outcome: 'fail', userHash, error_class: result.error_class, status: result.status });
+    const code = result.error_class === 'invalid_grant' ? 401 : 502;
+    sendAuthJSON(res, code, { status: 'refresh_failed', error: result.error_class });
     return;
   }
 
-  const tokenData = await tokenResponse.json() as Record<string, unknown>;
+  const newAccessToken = result.data.access_token as string;
+  const newRefreshToken = (result.data.refresh_token as string) || oauth.refreshToken;
+  const expiresIn = result.data.expires_in as number | undefined;
+  const newExpiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 8 * 60 * 60 * 1000;
 
-  if (!tokenResponse.ok) {
-    sendJSON(res, 502, {
-      status: 'refresh_failed',
-      message: 'Token refresh failed. Re-authentication may be required.',
-      detail: tokenData,
-    });
-    return;
-  }
-
-  const newAccessToken = tokenData.access_token as string;
-  const newRefreshToken = tokenData.refresh_token as string;
-  const expiresIn = tokenData.expires_in as number | undefined;
-
-  if (!newAccessToken) {
-    sendJSON(res, 502, { status: 'error', message: 'Refresh response missing access_token' });
-    return;
-  }
-
-  const newExpiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000;
-
-  // Update credentials on disk
   creds.claudeAiOauth.accessToken = newAccessToken;
-  if (newRefreshToken) creds.claudeAiOauth.refreshToken = newRefreshToken;
+  creds.claudeAiOauth.refreshToken = newRefreshToken;
   creds.claudeAiOauth.expiresAt = newExpiresAt;
 
   await writeFile(credPath, JSON.stringify(creds, null, 2), { encoding: 'utf-8', mode: 0o644 });
 
   const tokenChanged = newAccessToken !== oauth.accessToken;
 
-  log('info', 'Token refresh completed', { userHash, tokenChanged, newExpiresAt });
+  log('info', 'oauth_refresh', { outcome: 'ok', userHash, tokenChanged });
 
-  sendJSON(res, 200, {
+  sendAuthJSON(res, 200, {
     status: 'refreshed',
     access_token: newAccessToken,
     expires_at: newExpiresAt,
     subscription_type: oauth.subscriptionType ?? null,
     token_changed: tokenChanged,
+  });
+}
+
+// ── POST /auth/refresh-stateless (Worker holds the refresh_token) ─
+
+export async function authRefreshStatelessHandler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // 1. Internal key must be configured
+  const internalKey = getInternalKey();
+  if (!internalKey) {
+    log('warn', 'refresh_stateless', { outcome: 'fail', error_class: 'not_configured' });
+    sendAuthJSON(res, 503, { error: 'internal_key_not_configured' });
+    return;
+  }
+
+  // 2. Rate limit per IP (60/min)
+  const ip = getRequestIp(req);
+  if (!checkRefreshRateLimit(ip)) {
+    log('info', 'refresh_stateless', { outcome: 'fail', error_class: 'rate_limited' });
+    sendAuthJSON(res, 429, { error: 'rate_limited' });
+    return;
+  }
+
+  // 3. Verify X-Internal-Key (constant-time)
+  const providedKey = req.headers['x-internal-key'];
+  if (typeof providedKey !== 'string' || !checkInternalKey(providedKey, internalKey)) {
+    log('info', 'refresh_stateless', { outcome: 'fail', error_class: 'unauthorized' });
+    sendAuthJSON(res, 401, { error: 'unauthorized' });
+    return;
+  }
+
+  // 4. Parse body
+  let body: { refresh_token?: string };
+  try {
+    body = await parseJsonBody<{ refresh_token?: string }>(req);
+  } catch {
+    sendAuthJSON(res, 400, { error: 'invalid_body' });
+    return;
+  }
+
+  if (!body.refresh_token || typeof body.refresh_token !== 'string') {
+    sendAuthJSON(res, 400, { error: 'refresh_token_required' });
+    return;
+  }
+
+  // 5. Call Anthropic
+  const result = await callTokenEndpoint({
+    grant_type: 'refresh_token',
+    refresh_token: body.refresh_token,
+    client_id: OAUTH.CLIENT_ID,
+  });
+
+  if (!result.ok) {
+    log('info', 'refresh_stateless', { outcome: 'fail', error_class: result.error_class, status: result.status });
+    const code = result.error_class === 'invalid_grant' ? 401 : 502;
+    sendAuthJSON(res, code, { error: result.error_class });
+    return;
+  }
+
+  const newAccessToken = result.data.access_token as string;
+  const newRefreshToken = (result.data.refresh_token as string) || body.refresh_token;
+  const expiresIn = result.data.expires_in as number | undefined;
+  const expiresAt = expiresIn ? Date.now() + expiresIn * 1000 : Date.now() + 8 * 60 * 60 * 1000;
+
+  log('info', 'refresh_stateless', { outcome: 'ok' });
+
+  sendAuthJSON(res, 200, {
+    access_token: newAccessToken,
+    refresh_token: newRefreshToken,
+    expires_at: expiresAt,
   });
 }
